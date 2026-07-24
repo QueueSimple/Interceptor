@@ -64,6 +64,41 @@ public enum VMAdoptMode: String, Codable, Sendable, Equatable {
     case reference
 }
 
+public enum VMGuestAgentTransport: String, Codable, Sendable, Equatable {
+    case vsock
+    case tcp
+    case ssh
+    case serial
+}
+
+public struct VMGuestAgentSpec: Codable, Sendable, Equatable {
+    public var enabled: Bool
+    public var transport: VMGuestAgentTransport
+    public var host: String?
+    public var port: UInt32
+    public var authTokenRef: String?
+    public var installedVersion: String?
+    public var trustStatus: String?
+
+    public init(
+        enabled: Bool = true,
+        transport: VMGuestAgentTransport,
+        host: String? = nil,
+        port: UInt32 = 3294,
+        authTokenRef: String? = nil,
+        installedVersion: String? = nil,
+        trustStatus: String? = nil
+    ) {
+        self.enabled = enabled
+        self.transport = transport
+        self.host = host
+        self.port = port
+        self.authTokenRef = authTokenRef
+        self.installedVersion = installedVersion
+        self.trustStatus = trustStatus
+    }
+}
+
 /// virtio-fs share. `tag` is the mount label the guest uses: `mount -t virtiofs <tag>`.
 public struct VMShareSpec: Codable, Sendable, Equatable {
     public var hostPath: String
@@ -105,6 +140,9 @@ public struct VMSpec: Codable, Sendable, Equatable {
     /// keeps NAT DHCP leases stable across boots and lets the host map a
     /// running macOS guest back to its bridge100 IP.
     public var macAddress: String?
+    /// Guest control transport. A nil value preserves legacy specs, but new
+    /// code treats TCP as explicit only when this field says transport == tcp.
+    public var agent: VMGuestAgentSpec?
 
     public init(
         name: String,
@@ -123,7 +161,8 @@ public struct VMSpec: Codable, Sendable, Equatable {
         provider: VMProviderKind? = nil,
         sourcePath: String? = nil,
         adoptMode: VMAdoptMode? = nil,
-        macAddress: String? = nil
+        macAddress: String? = nil,
+        agent: VMGuestAgentSpec? = nil
     ) {
         self.name = name
         self.id = id
@@ -142,6 +181,7 @@ public struct VMSpec: Codable, Sendable, Equatable {
         self.sourcePath = sourcePath
         self.adoptMode = adoptMode
         self.macAddress = macAddress
+        self.agent = agent
     }
 
     /// Static validation that does NOT require Virtualization framework

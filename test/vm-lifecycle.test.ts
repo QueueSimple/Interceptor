@@ -17,7 +17,7 @@
 
 import { test, expect } from "bun:test"
 import { parseMacosCommand } from "../cli/commands/macos"
-import { existsSync, rmSync, mkdtempSync } from "node:fs"
+import { existsSync, rmSync, mkdtempSync, readFileSync } from "node:fs"
 import { join } from "node:path"
 import { tmpdir } from "node:os"
 
@@ -102,6 +102,14 @@ test("vm start — flags wire into action correctly", () => {
   const action = p(["macos", "vm", "start", "lin1", "--headless", "--wait-for-vsock"])
   expect(action.type).toBe("macos_vm_start")
   expect(action.headless).toBe(true)
+  expect(action.waitForAgent).toBe(true)
+  expect(action.waitForVsock).toBe(true)
+})
+
+test("vm start — accepts --wait-for-agent as public readiness flag", () => {
+  const action = p(["macos", "vm", "start", "lin1", "--wait-for-agent"])
+  expect(action.type).toBe("macos_vm_start")
+  expect(action.waitForAgent).toBe(true)
   expect(action.waitForVsock).toBe(true)
 })
 
@@ -149,6 +157,16 @@ test("vm snapshot — defaults to op=create", () => {
   expect(action.snapshotOp).toBe("create")
 })
 
+test("vm restore — parses paused-state and disk-only flags", () => {
+  const action = p(["macos", "vm", "restore", "lin1", "scratch", "--paused-state", "--disk-only", "--headless"])
+  expect(action.type).toBe("macos_vm_restore")
+  expect(action.name).toBe("lin1")
+  expect(action.tag).toBe("scratch")
+  expect(action.pausedStateOnly).toBe(true)
+  expect(action.diskOnly).toBe(true)
+  expect(action.headless).toBe(true)
+})
+
 test("vm list — minimal action with no flags", () => {
   const action = p(["macos", "vm", "list"])
   expect(action.type).toBe("macos_vm_list")
@@ -178,6 +196,15 @@ test("vm port-forward — renamed to port_forward in action type", () => {
   expect(action.type).toBe("macos_vm_port_forward")
 })
 
+test("vm console — parses bounded read and write flags", () => {
+  const action = p(["macos", "vm", "console", "lin1", "--write", "status\n", "--max-bytes", "2048", "--timeout", "2"])
+  expect(action.type).toBe("macos_vm_console")
+  expect(action.name).toBe("lin1")
+  expect(action.write).toBe("status\n")
+  expect(action.maxBytes).toBe(2048)
+  expect(action.timeout).toBe(2)
+})
+
 test("vm tcc profile generate — parses guest profile request", () => {
   const action = p([
     "macos",
@@ -196,6 +223,35 @@ test("vm tcc profile generate — parses guest profile request", () => {
   expect(action.name).toBe("mactest")
   expect(action.out).toBe("/tmp/guest.mobileconfig")
   expect(action.services).toEqual(["Accessibility", "PostEvent"])
+})
+
+test("vm trust — parses guest prompt and reset flags", () => {
+  const action = p(["macos", "vm", "trust", "mactest", "--walkthrough", "--reset-denied", "--timeout", "45"])
+  expect(action.type).toBe("macos_vm_trust")
+  expect(action.name).toBe("mactest")
+  expect(action.prompt).toBe(true)
+  expect(action.walkthrough).toBe(true)
+  expect(action.resetDenied).toBe(true)
+  expect(action.timeout).toBe(45)
+})
+
+test("vm trust — no-prompt disables prompt/reset flags", () => {
+  const action = p([
+    "macos",
+    "vm",
+    "trust",
+    "mactest",
+    "--no-prompt",
+    "--prompt",
+    "--accessibility-prompt",
+    "--screen-prompt",
+    "--reset-denied",
+  ])
+  expect(action.noPrompt).toBe(true)
+  expect(action.prompt).toBe(false)
+  expect(action.accessibilityPrompt).toBe(false)
+  expect(action.screenPrompt).toBe(false)
+  expect(action.resetDenied).toBe(false)
 })
 
 test("vm cp — infers vm name from destination", () => {
@@ -272,4 +328,14 @@ test("vm create — stateDir override propagates", () => {
     "/tmp/explicit",
   ])
   expect(action.stateDir).toBe("/tmp/explicit")
+})
+
+test("InterceptorD macOS guest agent defaults to VSOCK transport", () => {
+  const source = readFileSync(join(import.meta.dir, "..", "interceptor-bridge", "InterceptorD", "main.swift"), "utf8")
+  expect(source).toContain("func serveVsock()")
+  expect(source).toContain("AF_VSOCK")
+  expect(source).toContain("VMADDR_CID_ANY")
+  expect(source).toContain("INTERCEPTOR_GUEST_TCP_LISTEN")
+  expect(source).not.toContain("Darwin doesn't expose AF_VSOCK")
+  expect(source).not.toContain("macOS guests currently listen")
 })

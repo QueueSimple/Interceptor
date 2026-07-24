@@ -1,8 +1,11 @@
 // InterceptorD (in-guest agent)
 //
-// Listens on vsock port 3294 inside a Linux or macOS guest. Speaks the
-// same length-prefixed JSON framing as the host bridge (`WireFormat`
-// pattern). Each inbound request looks like:
+// Guests listen on AF_VSOCK port 3294 by default. Apple documents
+// VZVirtioSocketDevice as a host-to-guest port connection, and the macOS SDK
+// exposes AF_VSOCK / sockaddr_vm for the guest-side listener. A normal TCP
+// listener is available only as an explicit diagnostic fallback.
+// Both paths speak the same length-prefixed JSON framing as the host bridge
+// (`WireFormat` pattern). Each inbound request looks like:
 //
 //   { "id": "<uuid>", "action": { "verb": "exec", ... } }
 //
@@ -23,12 +26,8 @@
 //   cp_in       — receive bytes into a guest path (host pushes)
 //   cp_out      — read a guest path and return bytes (host pulls)
 //
-// vsock semantics on Linux: AF_VSOCK + SOCK_STREAM, family-specific
-// address. On macOS: Darwin doesn't expose AF_VSOCK to user-space; the
-// macOS guest agent therefore binds on a localhost loopback when run
-// under VZ, and the host's VsockGuestAgent connects via
-// VZVirtioSocketDevice.connect(toPort:) — the connection inside the
-// guest is a normal SOCK_STREAM that lands here.
+// vsock semantics: AF_VSOCK + SOCK_STREAM, family-specific address bound to
+// VMADDR_CID_ANY and the Interceptor agent port.
 
 import Foundation
 import Darwin
@@ -76,6 +75,20 @@ func handleExec(_ action: [String: Any]) -> [String: Any] {
     }
     let workdir = action["workdir"] as? String
     let env = action["env"] as? [String: String] ?? [:]
+    let timeout: TimeInterval = {
+        switch action["timeout"] {
+        case let number as NSNumber:
+            return max(0, number.doubleValue)
+        case let double as Double:
+            return max(0, double)
+        case let int as Int:
+            return max(0, TimeInterval(int))
+        case let string as String:
+            return max(0, TimeInterval(string) ?? 0)
+        default:
+            return 0
+        }
+    }()
 
     let task = Process()
     task.executableURL = URL(fileURLWithPath: argv[0])
@@ -97,7 +110,21 @@ func handleExec(_ action: [String: Any]) -> [String: Any] {
     } catch {
         return ["success": false, "error": "exec: spawn failed: \(error.localizedDescription)"]
     }
-    task.waitUntilExit()
+    let sem = DispatchSemaphore(value: 0)
+    task.terminationHandler = { _ in sem.signal() }
+    var timedOut = false
+    if timeout > 0 {
+        timedOut = sem.wait(timeout: .now() + timeout) == .timedOut
+        if timedOut {
+            task.terminate()
+            if sem.wait(timeout: .now() + 2) == .timedOut {
+                kill(task.processIdentifier, SIGKILL)
+                _ = sem.wait(timeout: .now() + 2)
+            }
+        }
+    } else {
+        task.waitUntilExit()
+    }
     let durationMs = Int(Date().timeIntervalSince(started) * 1000)
 
     let stdoutData = outPipe.fileHandleForReading.readDataToEndOfFile()
@@ -111,7 +138,8 @@ func handleExec(_ action: [String: Any]) -> [String: Any] {
             "exitCode": task.terminationStatus,
             "stdout": stdout,
             "stderr": stderr,
-            "durationMs": durationMs
+            "durationMs": durationMs,
+            "timedOut": timedOut
         ] as [String: Any]
     ]
 }
@@ -230,11 +258,47 @@ func handleScreenshot(_ action: [String: Any]) -> [String: Any] {
     return ["success": true, "data": ["path": out, "width": cgImage.width, "height": cgImage.height, "bytes": png.count]]
 }
 
+func appMatches(_ app: NSRunningApplication, query: String) -> Bool {
+    let q = query.lowercased()
+    let candidates = [
+        app.localizedName,
+        app.bundleIdentifier,
+        app.bundleURL?.deletingPathExtension().lastPathComponent,
+        app.executableURL?.lastPathComponent,
+    ].compactMap { $0?.lowercased() }
+    return candidates.contains(q) || candidates.contains { $0.contains(q) }
+}
+
+func resolveRunningApp(_ query: String?) -> NSRunningApplication? {
+    let trimmed = query?.trimmingCharacters(in: .whitespacesAndNewlines)
+    if let trimmed, !trimmed.isEmpty {
+        return NSWorkspace.shared.runningApplications.first { appMatches($0, query: trimmed) }
+    }
+    return NSWorkspace.shared.frontmostApplication
+}
+
+func eventTargetPID(_ action: [String: Any]) -> pid_t? {
+    guard let app = action["app"] as? String, !app.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+        return nil
+    }
+    return resolveRunningApp(app)?.processIdentifier
+}
+
+func postEvent(_ event: CGEvent?, targetPID: pid_t?) {
+    guard let event else { return }
+    if let targetPID {
+        event.postToPid(targetPID)
+    } else {
+        event.post(tap: .cghidEventTap)
+    }
+}
+
 func handleType(_ action: [String: Any]) -> [String: Any] {
     guard let text = action["text"] as? String else {
         return ["success": false, "error": "type: missing 'text'"]
     }
     let source = CGEventSource(stateID: .hidSystemState)
+    let pid = eventTargetPID(action)
     for char in text.unicodeScalars {
         // Use the unicode-string path so we don't need to map every key.
         let down = CGEvent(keyboardEventSource: source, virtualKey: 0, keyDown: true)
@@ -242,11 +306,11 @@ func handleType(_ action: [String: Any]) -> [String: Any] {
         var u = UniChar(char.value)
         down?.keyboardSetUnicodeString(stringLength: 1, unicodeString: &u)
         up?.keyboardSetUnicodeString(stringLength: 1, unicodeString: &u)
-        down?.post(tap: .cghidEventTap)
-        up?.post(tap: .cghidEventTap)
+        postEvent(down, targetPID: pid)
+        postEvent(up, targetPID: pid)
         usleep(10_000)
     }
-    return ["success": true, "data": ["typed": text.count]]
+    return ["success": true, "data": ["typed": text.count, "targetPID": pid as Any? ?? NSNull()]]
 }
 
 func handleClick(_ action: [String: Any]) -> [String: Any] {
@@ -263,9 +327,10 @@ func handleClick(_ action: [String: Any]) -> [String: Any] {
     default: mb = .left; down = .leftMouseDown; up = .leftMouseUp
     }
     let pt = CGPoint(x: x, y: y)
-    CGEvent(mouseEventSource: source, mouseType: down, mouseCursorPosition: pt, mouseButton: mb)?.post(tap: .cghidEventTap)
-    CGEvent(mouseEventSource: source, mouseType: up, mouseCursorPosition: pt, mouseButton: mb)?.post(tap: .cghidEventTap)
-    return ["success": true, "data": ["x": x, "y": y, "button": button]]
+    let pid = eventTargetPID(action)
+    postEvent(CGEvent(mouseEventSource: source, mouseType: down, mouseCursorPosition: pt, mouseButton: mb), targetPID: pid)
+    postEvent(CGEvent(mouseEventSource: source, mouseType: up, mouseCursorPosition: pt, mouseButton: mb), targetPID: pid)
+    return ["success": true, "data": ["x": x, "y": y, "button": button, "targetPID": pid as Any? ?? NSNull()]]
 }
 
 func handleKeys(_ action: [String: Any]) -> [String: Any] {
@@ -280,10 +345,24 @@ func handleKeys(_ action: [String: Any]) -> [String: Any] {
 func handleReadAX(_ action: [String: Any]) -> [String: Any] {
     let depth = (action["max_depth"] as? Int) ?? 4
     let maxNodes = (action["max_nodes"] as? Int) ?? 500
-    let systemElement = AXUIElementCreateSystemWide()
+    guard let app = resolveRunningApp(action["app"] as? String) else {
+        return ["success": false, "error": "read_ax: no target app found"]
+    }
+
+    let appElement = AXUIElementCreateApplication(app.processIdentifier)
     var visited = 0
-    let tree = axNode(systemElement, depth: 0, maxDepth: depth, maxNodes: maxNodes, visited: &visited)
-    return ["success": true, "data": ["tree": tree, "visited": visited, "maxDepth": depth]]
+    let tree = axNode(appElement, depth: 0, maxDepth: depth, maxNodes: maxNodes, visited: &visited)
+    return [
+        "success": true,
+        "data": [
+            "app": app.localizedName ?? "",
+            "bundleIdentifier": app.bundleIdentifier ?? "",
+            "pid": app.processIdentifier,
+            "tree": tree,
+            "visited": visited,
+            "maxDepth": depth
+        ] as [String: Any]
+    ]
 }
 
 func axString(_ el: AXUIElement, _ attr: CFString) -> String? {
@@ -337,8 +416,18 @@ func axNode(_ el: AXUIElement, depth: Int, maxDepth: Int, maxNodes: Int, visited
 
     guard depth < maxDepth, visited < maxNodes else { return node }
     var childrenRef: CFTypeRef?
+    var children: [AXUIElement] = []
     let result = AXUIElementCopyAttributeValue(el, kAXChildrenAttribute as CFString, &childrenRef)
-    if result == .success, let children = childrenRef as? [AXUIElement], !children.isEmpty {
+    if result == .success, let axChildren = childrenRef as? [AXUIElement], !axChildren.isEmpty {
+        children = axChildren
+    } else {
+        var windowsRef: CFTypeRef?
+        let windowsResult = AXUIElementCopyAttributeValue(el, kAXWindowsAttribute as CFString, &windowsRef)
+        if windowsResult == .success, let windows = windowsRef as? [AXUIElement], !windows.isEmpty {
+            children = windows
+        }
+    }
+    if !children.isEmpty {
         var childNodes: [[String: Any]] = []
         for child in children.prefix(50) {
             if visited >= maxNodes { break }
@@ -446,23 +535,144 @@ func handleLogs(_ action: [String: Any]) -> [String: Any] {
     return ["success": true, "data": ["logs": entries]]
 }
 
+func boolFlag(_ action: [String: Any], _ key: String) -> Bool {
+    return action[key] as? Bool ?? false
+}
+
+#if os(macOS)
+func resetTCC(service: String) -> [String: Any] {
+    let task = Process()
+    task.executableURL = URL(fileURLWithPath: "/usr/bin/tccutil")
+    task.arguments = ["reset", service]
+    let stdout = Pipe()
+    let stderr = Pipe()
+    task.standardOutput = stdout
+    task.standardError = stderr
+    do {
+        try task.run()
+    } catch {
+        return [
+            "service": service,
+            "ok": false,
+            "error": error.localizedDescription,
+        ]
+    }
+    task.waitUntilExit()
+    let stdoutText = String(data: stdout.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+    let stderrText = String(data: stderr.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+    return [
+        "service": service,
+        "ok": task.terminationStatus == 0,
+        "exitCode": task.terminationStatus,
+        "stdout": stdoutText,
+        "stderr": stderrText,
+    ]
+}
+
+func checkAccessibility(prompt: Bool) -> Bool {
+    if prompt {
+        let key = "AXTrustedCheckOptionPrompt" as CFString
+        let options = [key: true] as CFDictionary
+        return AXIsProcessTrustedWithOptions(options)
+    }
+    return AXIsProcessTrusted()
+}
+
+func checkScreenRecording(prompt: Bool) -> Bool {
+    if !prompt {
+        return CGPreflightScreenCaptureAccess()
+    }
+    if CGPreflightScreenCaptureAccess() {
+        return true
+    }
+    return CGRequestScreenCaptureAccess()
+}
+
+func openPrivacyPane(_ anchor: String) -> Bool {
+    guard let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?\(anchor)") else {
+        return false
+    }
+    return NSWorkspace.shared.open(url)
+}
+#endif
+
 func handleTrust(_ action: [String: Any]) -> [String: Any] {
 #if os(macOS)
-    let accessibility = AXIsProcessTrusted()
-    let screenRecording = CGPreflightScreenCaptureAccess()
+    let noPrompt = boolFlag(action, "noPrompt")
+    let prompt = !noPrompt && boolFlag(action, "prompt")
+    let walkthrough = !noPrompt && boolFlag(action, "walkthrough")
+    let accessibilityPrompt = !noPrompt && boolFlag(action, "accessibilityPrompt")
+    let screenPrompt = !noPrompt && boolFlag(action, "screenPrompt")
+    let resetDenied = !noPrompt && boolFlag(action, "resetDenied")
+
+    let shouldPromptAccessibility = prompt || walkthrough || accessibilityPrompt
+    let shouldPromptScreen = prompt || walkthrough || screenPrompt
+
+    var resetResults: [[String: Any]] = []
+    if resetDenied {
+        if shouldPromptAccessibility {
+            resetResults.append(resetTCC(service: "Accessibility"))
+        }
+        if shouldPromptScreen {
+            resetResults.append(resetTCC(service: "ScreenCapture"))
+        }
+    }
+
+    let accessibility = checkAccessibility(prompt: shouldPromptAccessibility)
+    let screenRecording = checkScreenRecording(prompt: shouldPromptScreen)
+
+    var opened: [String] = []
+    if walkthrough {
+        if !accessibility {
+            if openPrivacyPane("Privacy_Accessibility") {
+                opened.append("Accessibility")
+            }
+        } else if !screenRecording {
+            if openPrivacyPane("Privacy_ScreenCapture") {
+                opened.append("Screen Recording")
+            }
+        }
+    }
+
+    var prompted: [String] = []
+    if shouldPromptAccessibility { prompted.append("Accessibility") }
+    if shouldPromptScreen { prompted.append("Screen Recording") }
+
+    var actionRequired: [String] = []
+    if !accessibility {
+        actionRequired.append("System Settings -> Privacy & Security -> Accessibility -> Enable InterceptorD")
+    }
+    if !screenRecording {
+        actionRequired.append("System Settings -> Privacy & Security -> Screen Recording -> Enable InterceptorD")
+    }
+
+    var data: [String: Any] = [
+        "platform": "macos",
+        "accessibility": accessibility ? "granted" : "denied",
+        "screenRecording": screenRecording ? "granted" : "denied",
+        "postEvent": "unknown",
+        "inputMonitoring": "unknown",
+        "notes": [
+            "Accessibility and Screen Recording expose only boolean preflight state through public APIs here.",
+            "PostEvent/Input Monitoring should be validated by attempting the requested verb and checking failure diagnostics.",
+            "On unmanaged macOS guests, prompts still require user approval in the guest UI; SSH cannot silently grant TCC.",
+        ],
+    ]
+    if !prompted.isEmpty {
+        data["prompted"] = prompted
+    }
+    if !opened.isEmpty {
+        data["opened"] = opened
+    }
+    if !resetResults.isEmpty {
+        data["reset"] = resetResults
+    }
+    if !actionRequired.isEmpty {
+        data["action_required"] = actionRequired
+    }
     return [
         "success": true,
-        "data": [
-            "platform": "macos",
-            "accessibility": accessibility ? "granted" : "denied",
-            "screenRecording": screenRecording ? "granted" : "denied",
-            "postEvent": "unknown",
-            "inputMonitoring": "unknown",
-            "notes": [
-                "Accessibility and Screen Recording expose only boolean preflight state through public APIs here.",
-                "PostEvent/Input Monitoring should be validated by attempting the requested verb and checking failure diagnostics.",
-            ],
-        ],
+        "data": data,
     ]
 #else
     return [
@@ -476,7 +686,14 @@ func handleTrust(_ action: [String: Any]) -> [String: Any] {
 #endif
 }
 
-func isMutatingVerb(_ verb: String) -> Bool {
+func isMutatingVerb(_ verb: String, action: [String: Any]) -> Bool {
+    if verb == "trust" {
+        return boolFlag(action, "prompt")
+            || boolFlag(action, "walkthrough")
+            || boolFlag(action, "accessibilityPrompt")
+            || boolFlag(action, "screenPrompt")
+            || boolFlag(action, "resetDenied")
+    }
     switch verb {
     case "ping", "get_ip", "trust", "read_ax", "screenshot", "logs":
         return false
@@ -495,7 +712,7 @@ func dispatch(request: [String: Any]) -> [String: Any] {
     guard let verb = action["verb"] as? String else {
         return errorResult(id, "missing action.verb")
     }
-    if let requiredAuthToken, isMutatingVerb(verb) {
+    if let requiredAuthToken, isMutatingVerb(verb, action: action) {
         guard action["authToken"] as? String == requiredAuthToken else {
             return errorResult(id, "auth: invalid or missing authToken")
         }
@@ -520,27 +737,42 @@ func dispatch(request: [String: Any]) -> [String: Any] {
     return ["id": id, "result": result]
 }
 
-// MARK: - Loopback server (works on both Linux & macOS guests)
+// MARK: - Guest-agent server
 //
-// In the macOS guest variant we bind on 127.0.0.1:<port> and rely on
-// VZVirtioSocketDevice's port-mapping inside VZ to route the host
-// connection. On Linux a real AF_VSOCK socket is available via the
-// kernel virtio_vsock driver; we open AF_VSOCK in that case.
+// macOS exposes AF_VSOCK and sockaddr_vm in sys/socket.h and sys/vsock.h.
+// Use literal fallbacks so the source remains clear if Swift's imported
+// constants vary by SDK.
 
-func serve() {
-#if os(Linux)
-    let AF_VSOCK_C: Int32 = 40  // Linux AF_VSOCK
-    let VMADDR_CID_ANY: UInt32 = 0xFFFFFFFF
-    let server = socket(AF_VSOCK_C, Int32(SOCK_STREAM.rawValue), 0)
-    if server < 0 {
-        fputs("InterceptorD: AF_VSOCK socket() failed\n", stderr)
-        exit(1)
+let AF_VSOCK_C: Int32 = 40
+let VMADDR_CID_ANY_C: UInt32 = 0xFFFFFFFF
+
+func serveAcceptedClients(server: Int32) -> Never {
+    Darwin.listen(server, 5)
+    while true {
+        let client = Darwin.accept(server, nil, nil)
+        if client < 0 { continue }
+        Thread.detachNewThread { handleClient(fd: client) }
     }
-    // sockaddr_vm layout: u16 family, u16 reserved, u32 port, u32 cid, ...
+}
+
+func openVsockServer() -> Int32? {
+#if os(Linux)
+    let streamType = Int32(SOCK_STREAM.rawValue)
+#else
+    let streamType = SOCK_STREAM
+#endif
+    let server = socket(AF_VSOCK_C, streamType, 0)
+    if server < 0 {
+        fputs("InterceptorD: AF_VSOCK socket() failed: \(String(cString: strerror(errno)))\n", stderr)
+        return nil
+    }
     var addr = sockaddr_vm()
+#if os(macOS)
+    addr.svm_len = UInt8(MemoryLayout<sockaddr_vm>.size)
+#endif
     addr.svm_family = sa_family_t(AF_VSOCK_C)
     addr.svm_port = kAgentPort
-    addr.svm_cid = VMADDR_CID_ANY
+    addr.svm_cid = VMADDR_CID_ANY_C
     let sz = socklen_t(MemoryLayout<sockaddr_vm>.size)
     let bindRes = withUnsafePointer(to: &addr) { ptr -> Int32 in
         ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sptr in
@@ -549,18 +781,23 @@ func serve() {
     }
     if bindRes != 0 {
         fputs("InterceptorD: bind() failed: \(String(cString: strerror(errno)))\n", stderr)
-        exit(1)
+        Darwin.close(server)
+        return nil
     }
-    Darwin.listen(server, 5)
+    return server
+}
+
+func serveVsock() -> Never {
     while true {
-        let client = Darwin.accept(server, nil, nil)
-        if client < 0 { continue }
-        Thread.detachNewThread { handleClient(fd: client) }
+        if let server = openVsockServer() {
+            serveAcceptedClients(server: server)
+        }
+        fputs("InterceptorD: waiting for VSOCK device on port \(kAgentPort)\n", stderr)
+        Darwin.sleep(5)
     }
-#else
-    // macOS guest path — bind on all guest interfaces. Virtualization's
-    // macOS guest socket path is not reliable for every host/guest pairing,
-    // so the host bridge can fall back to the guest's NAT IP.
+}
+
+func serveTcpDiagnosticFallback() -> Never {
     let server = socket(AF_INET, SOCK_STREAM, 0)
     if server < 0 {
         fputs("InterceptorD: socket() failed\n", stderr)
@@ -582,13 +819,14 @@ func serve() {
         fputs("InterceptorD: bind() failed: \(String(cString: strerror(errno)))\n", stderr)
         exit(1)
     }
-    Darwin.listen(server, 5)
-    while true {
-        let client = Darwin.accept(server, nil, nil)
-        if client < 0 { continue }
-        Thread.detachNewThread { handleClient(fd: client) }
+    serveAcceptedClients(server: server)
+}
+
+func serve() -> Never {
+    if ProcessInfo.processInfo.environment["INTERCEPTOR_GUEST_TCP_LISTEN"] == "1" {
+        serveTcpDiagnosticFallback()
     }
-#endif
+    serveVsock()
 }
 
 func handleClient(fd: Int32) {
@@ -617,5 +855,6 @@ func handleClient(fd: Int32) {
 
 // MARK: - Entry point
 
-fputs("InterceptorD starting on port \(kAgentPort)\n", stderr)
+let transport = ProcessInfo.processInfo.environment["INTERCEPTOR_GUEST_TCP_LISTEN"] == "1" ? "tcp-diagnostic" : "vsock"
+fputs("InterceptorD starting on \(transport) port \(kAgentPort)\n", stderr)
 serve()

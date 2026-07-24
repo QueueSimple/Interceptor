@@ -133,7 +133,13 @@ public struct VMAdoption: Sendable {
             provider: .lume,
             sourcePath: source.path,
             adoptMode: mode,
-            macAddress: config.macAddress
+            macAddress: config.macAddress,
+            agent: VMGuestAgentSpec(
+                enabled: true,
+                transport: .vsock,
+                port: kInterceptorGuestAgentPort,
+                trustStatus: "transport_unverified"
+            )
         )
         let bundle = try await registry.create(spec)
         var copied: [String] = []
@@ -168,7 +174,13 @@ public struct VMAdoption: Sendable {
             image: "latest",
             provider: .appleVZ,
             sourcePath: source.path,
-            adoptMode: mode
+            adoptMode: mode,
+            agent: VMGuestAgentSpec(
+                enabled: true,
+                transport: .vsock,
+                port: kInterceptorGuestAgentPort,
+                trustStatus: "transport_unverified"
+            )
         )
         let bundle = try await registry.create(spec)
         let pairs: [(String, URL)] = [

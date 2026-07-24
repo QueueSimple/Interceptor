@@ -276,108 +276,157 @@ final class FsDomain: DomainHandler, @unchecked Sendable {
             return
         }
 
-        // Try Spotlight (NSMetadataQuery) first. For machine-wide
-        // ("everywhere") scope, only match filenames — kMDItemTextContent
-        // across LocalComputerScope is unbounded and routinely blows past
-        // the gather window. Narrower scopes can still use the compound
-        // name+content predicate.
-        let mq = NSMetadataQuery()
-        mq.searchScopes = mqScopes
-        if scope == "everywhere" {
-            mq.predicate = NSPredicate(
-                format: "(kMDItemDisplayName LIKE[cd] %@) OR (kMDItemFSName LIKE[cd] %@)",
-                "*\(query)*", "*\(query)*"
-            )
-        } else {
-            mq.predicate = NSPredicate(
-                format: "(kMDItemDisplayName LIKE[cd] %@) OR (kMDItemFSName LIKE[cd] %@) OR (kMDItemTextContent LIKE[cd] %@)",
-                "*\(query)*", "*\(query)*", "*\(query)*"
-            )
-        }
-        mq.sortDescriptors = [NSSortDescriptor(key: NSMetadataItemFSContentChangeDateKey, ascending: false)]
-
-        let lock = NSLock()
-        var captured = false
-        var observer: NSObjectProtocol?
-
-        @Sendable func extractMatches(from query: NSMetadataQuery, max: Int) -> [[String: Any]] {
-            var rows: [[String: Any]] = []
-            for i in 0..<min(query.resultCount, max) {
-                guard let item = query.result(at: i) as? NSMetadataItem,
-                      let path = item.value(forAttribute: NSMetadataItemPathKey) as? String else { continue }
-                let pathUrl = URL(fileURLWithPath: path)
-                let kindLabel = item.value(forAttribute: NSMetadataItemKindKey) as? String
-                if !self.matchesKinds(requestedKinds, at: pathUrl, kindLabel: kindLabel) {
-                    continue
-                }
-                var entry: [String: Any] = ["path": path]
-                if let name = item.value(forAttribute: NSMetadataItemDisplayNameKey) as? String ??
-                              item.value(forAttribute: NSMetadataItemFSNameKey) as? String {
-                    entry["name"] = name
-                }
-                if let kindLabel { entry["kind"] = kindLabel }
-                if let size = item.value(forAttribute: NSMetadataItemFSSizeKey) as? Int { entry["size"] = size }
-                if let modified = item.value(forAttribute: NSMetadataItemFSContentChangeDateKey) as? Date {
-                    entry["modified"] = ISO8601DateFormatter().string(from: modified)
-                }
-                rows.append(entry)
-            }
-            return rows
-        }
-
-        func finish(_ matches: [[String: Any]], indexed: Bool) {
-            lock.lock(); if captured { lock.unlock(); return }; captured = true; lock.unlock()
-            if let obs = observer { NotificationCenter.default.removeObserver(obs); observer = nil }
-            mq.stop()
+        // Spotlight via `mdfind` (synchronous). NSMetadataQuery's async
+        // DidFinishGathering delivery does NOT fire in the faceless launchd-agent
+        // context — the query times out and falls back even with an
+        // operationQueue set: a deployed faceless bridge was measured timing out
+        // at ~2.18s and falling back, while `mdfind` from the same process
+        // returned results instantly. `mdfind` is a fresh process that connects
+        // to the metadata server directly and returns results synchronously
+        // regardless of run-loop context. `mqScopes` is retained above for the
+        // scope-resolution/validation it performs; the actual Spotlight scoping
+        // now flows through `bfsRoots` as `mdfind -onlyin` roots.
+        _ = mqScopes
+        let spotlight = self.spotlightSearchViaMdfind(
+            query: query,
+            scopePaths: bfsRoots,                 // [] for "everywhere" → no -onlyin
+            nameOnly: scope == "everywhere",      // content across the whole machine is unbounded
+            limit: limit,
+            requestedKinds: requestedKinds
+        )
+        if !spotlight.isEmpty {
             completion(WireFormat.success([
-                "matches": matches,
-                "indexed": indexed,
-                "source": indexed ? "spotlight" : "fallback",
+                "matches": spotlight,
+                "indexed": true,
+                "source": "spotlight",
                 "scope": scopeLabel,
                 "query": query,
-                "count": matches.count
+                "count": spotlight.count
             ]))
-        }
-
-        observer = NotificationCenter.default.addObserver(
-            forName: .NSMetadataQueryDidFinishGathering,
-            object: mq,
-            queue: nil
-        ) { _ in
-            mq.disableUpdates()
-            let rows = extractMatches(from: mq, max: limit)
-            finish(rows, indexed: true)
-        }
-
-        if !mq.start() {
-            finish([], indexed: false)
             return
         }
 
-        // Bound the wait — Spotlight should respond in <2s for indexed scopes.
-        // If empty after 2s, also kick off the fallback breadth-first scan;
-        // whichever produces a non-empty result first wins.
-        DispatchQueue.global().asyncAfter(deadline: .now() + 2.0) { [self] in
-            if captured { return }
-            // Snapshot whatever Spotlight has so far; if non-empty, take it.
-            mq.disableUpdates()
-            let snap = extractMatches(from: mq, max: limit)
-            if !snap.isEmpty {
-                finish(snap, indexed: true)
-                return
-            }
-            // Spotlight had nothing. Run the breadth-first enumerator fallback
-            // across every BFS root (skip when scope is "everywhere" since
-            // walking / unbounded would block this thread for minutes).
-            var allMatches: [[String: Any]] = []
-            for root in bfsRoots {
-                if allMatches.count >= limit { break }
-                let remaining = limit - allMatches.count
-                let chunk = self.fallbackBfsSearch(query: query, root: root, limit: remaining, requestedKinds: requestedKinds)
-                allMatches.append(contentsOf: chunk)
-            }
-            finish(allMatches, indexed: false)
+        // Spotlight returned nothing (or mdfind unavailable) → breadth-first
+        // fallback across the path roots (empty for "everywhere", so that scope
+        // simply yields no matches rather than an unbounded walk).
+        var allMatches: [[String: Any]] = []
+        for root in bfsRoots {
+            if allMatches.count >= limit { break }
+            let remaining = limit - allMatches.count
+            let chunk = self.fallbackBfsSearch(query: query, root: root, limit: remaining, requestedKinds: requestedKinds)
+            allMatches.append(contentsOf: chunk)
         }
+        completion(WireFormat.success([
+            "matches": allMatches,
+            "indexed": false,
+            "source": "fallback",
+            "scope": scopeLabel,
+            "query": query,
+            "count": allMatches.count
+        ]))
+    }
+
+    /// Synchronous Spotlight search via `mdfind`. Returns enriched matches, or
+    /// `[]` on no result / mdfind-unavailable (caller then runs the BFS
+    /// fallback). Mirrors the old NSMetadataQuery predicate: name-only for
+    /// machine-wide scope, name+content for rooted scopes. Runs one `mdfind` per
+    /// scope root (mdfind takes a single `-onlyin`), or one global run when
+    /// unscoped. Results are enriched with kind/size/modified in-process via
+    /// URLResourceValues — no per-result subprocess.
+    private func spotlightSearchViaMdfind(
+        query: String,
+        scopePaths: [String],
+        nameOnly: Bool,
+        limit: Int,
+        requestedKinds: Set<String>
+    ) -> [[String: Any]] {
+        let esc = query
+            .replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "\"", with: "\\\"")
+        let pat = "*\(esc)*"
+        let expr: String
+        if nameOnly {
+            expr = "(kMDItemFSName = \"\(pat)\"cd) || (kMDItemDisplayName = \"\(pat)\"cd)"
+        } else {
+            expr = "(kMDItemFSName = \"\(pat)\"cd) || (kMDItemDisplayName = \"\(pat)\"cd) || (kMDItemTextContent = \"\(pat)\"cd)"
+        }
+
+        // Gather candidate paths (dedupe; a few extra to survive kinds-filtering).
+        let gatherCap = max(limit * 4, limit)
+        var seen = Set<String>()
+        var paths: [String] = []
+        let runs: [String?] = scopePaths.isEmpty ? [nil] : scopePaths
+        outer: for sp in runs {
+            for p in runMdfind(onlyIn: sp, queryExpr: expr, maxResults: gatherCap) {
+                if seen.insert(p).inserted {
+                    paths.append(p)
+                    if paths.count >= gatherCap { break outer }
+                }
+            }
+        }
+
+        let iso = ISO8601DateFormatter()
+        var matches: [[String: Any]] = []
+        for path in paths {
+            if matches.count >= limit { break }
+            let url = URL(fileURLWithPath: path)
+            let vals = try? url.resourceValues(forKeys: [.contentTypeKey, .fileSizeKey, .contentModificationDateKey])
+            let kindLabel = vals?.contentType?.localizedDescription
+            if !self.matchesKinds(requestedKinds, at: url, kindLabel: kindLabel) { continue }
+            var entry: [String: Any] = ["path": path, "name": url.lastPathComponent]
+            if let kindLabel { entry["kind"] = kindLabel }
+            if let size = vals?.fileSize { entry["size"] = size }
+            if let modified = vals?.contentModificationDate {
+                entry["modified"] = iso.string(from: modified)
+            }
+            matches.append(entry)
+        }
+        return matches
+    }
+
+    /// Run `/usr/bin/mdfind` synchronously and return result paths (one absolute
+    /// path per stdout line, capped at `maxResults`). stderr is discarded
+    /// (mdfind logs locale-parser chatter there). Reads incrementally and
+    /// terminates mdfind once it has `maxResults` lines, so a query that matches
+    /// a huge set (e.g. 11k files for "media kit") still returns the first page
+    /// near-instantly instead of paying to enumerate every match. Returns `[]`
+    /// if mdfind cannot be launched.
+    private func runMdfind(onlyIn: String?, queryExpr: String, maxResults: Int) -> [String] {
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/usr/bin/mdfind")
+        var args: [String] = []
+        if let dir = onlyIn { args += ["-onlyin", dir] }
+        args.append(queryExpr)
+        proc.arguments = args
+        let out = Pipe()
+        proc.standardOutput = out
+        proc.standardError = FileHandle.nullDevice
+        do {
+            try proc.run()
+        } catch {
+            return []
+        }
+        let handle = out.fileHandleForReading
+        let cap = max(maxResults, 1)
+        var buffer = Data()
+        var lines: [String] = []
+        while lines.count < cap {
+            let chunk = handle.availableData          // blocks until data or EOF
+            if chunk.isEmpty { break }                // EOF — mdfind finished
+            buffer.append(chunk)
+            while let nl = buffer.firstIndex(of: 0x0A) {
+                let lineData = buffer.subdata(in: buffer.startIndex..<nl)
+                buffer.removeSubrange(buffer.startIndex...nl)
+                if let line = String(data: lineData, encoding: .utf8), !line.isEmpty {
+                    lines.append(line)
+                    if lines.count >= cap { break }
+                }
+            }
+        }
+        // Stop mdfind once we have enough — don't enumerate the whole match set.
+        proc.terminate()
+        proc.waitUntilExit()
+        return lines
     }
 
     /// Breadth-first fallback that visits the workspace root's top-level

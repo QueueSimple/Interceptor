@@ -45,7 +45,7 @@ final class MonitorSession: @unchecked Sendable {
 
     init(
         id: String,
-        taskId: String?,
+        taskId: String? = nil,
         instruction: String?,
         startTime: Date,
         scope: MonitorScope,

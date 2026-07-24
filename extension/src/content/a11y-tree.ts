@@ -5,6 +5,28 @@ import { getRelevantAttrs, getStyleBundle } from "./element-tree"
 export const LANDMARK_ROLES = new Set(["banner", "navigation", "main", "complementary", "contentinfo", "search", "form", "region"])
 export const LANDMARK_TAGS = new Set(["NAV", "MAIN", "ASIDE", "HEADER", "FOOTER", "FORM", "SECTION"])
 
+// An element is an upload target if it IS a file input or shallowly wraps one.
+// The depth bound keeps the hint high-signal — a dropzone root
+// renders its hidden <input type=file> as a near child, whereas a big modal /
+// <body> that merely contains one far below is not flagged. Surfacing this in
+// the a11y tree steers agents to `interceptor upload <ref> <path>` instead of
+// clicking (which opens a native OS panel the browser surface can't drive).
+export function isUploadTarget(el: Element, maxDepth = 3): boolean {
+  if (el instanceof HTMLInputElement && el.type === "file") return true
+  let frontier: Element[] = [el]
+  for (let d = 0; d < maxDepth && frontier.length; d++) {
+    const next: Element[] = []
+    for (const node of frontier) {
+      for (const child of Array.from(node.children)) {
+        if (child instanceof HTMLInputElement && child.type === "file") return true
+        next.push(child)
+      }
+    }
+    frontier = next
+  }
+  return false
+}
+
 export function getEffectiveRole(el: Element): string {
   const explicit = el.getAttribute("role")
   if (explicit) return explicit
@@ -115,7 +137,28 @@ export function buildA11yTree(
 
   function walk(el: Element, d: number) {
     if (d > maxDepth) return
-    if (!isVisible(el) && el.tagName !== "BODY") return
+
+    // Visibility disposition. `display:none` / `visibility:hidden` hide the
+    // whole subtree, so we stop. But an element that's invisible only because
+    // it is an out-of-flow box with a zero-area rect — a shrink-to-fit portal /
+    // popper wrapper that has collapsed to 0×0 while its descendants render
+    // elsewhere — must still be descended into: those descendants are
+    // visibility-checked individually. Only genuinely out-of-flow positions
+    // (CSS "removed from normal flow" = `absolute` / `fixed`) qualify; in-flow
+    // boxes (`static` / `relative` / `sticky` — sticky is in-flow per CSS) are
+    // pruned as before, so collapsed/empty in-flow content doesn't leak in. The
+    // element itself is only emitted when it is actually visible.
+    //
+    // One computed-style read per element, shared between the visibility test
+    // and the disposition below: isVisible() reads computed style too, so we
+    // pass it in to avoid a second forced style resolution on this hot path.
+    const style = el.tagName === "BODY" ? null : getComputedStyle(el)
+    const selfVisible = el.tagName === "BODY" || isVisible(el, style!)
+    if (!selfVisible) {
+      if (style!.display === "none" || style!.visibility === "hidden") return
+      const pos = style!.position
+      if (pos !== "fixed" && pos !== "absolute") return
+    }
 
     const role = getEffectiveRole(el)
     const tag = el.tagName.toLowerCase()
@@ -124,7 +167,7 @@ export function buildA11yTree(
     const isInteractiveEl = isInteractive(el, INTERACTIVE_TAGS, INTERACTIVE_ROLES)
     const prefix = compact ? ">".repeat(d) : "  ".repeat(d)
 
-    if (isLandmark && !isInteractiveEl) {
+    if (selfVisible && isLandmark && !isInteractiveEl) {
       const name = getAccessibleName(el)
       const hasName = !!name && name !== (el.textContent || "").trim().slice(0, 80)
       if (compact) {
@@ -135,7 +178,7 @@ export function buildA11yTree(
       }
     }
 
-    if (isHeading && filter === "all") {
+    if (selfVisible && isHeading && filter === "all") {
       const name = getAccessibleName(el)
       if (compact) {
         lines.push(`${prefix}heading|${name}`)
@@ -144,21 +187,24 @@ export function buildA11yTree(
       }
     }
 
-    if (isInteractiveEl) {
+    if (selfVisible && isInteractiveEl) {
       const refId = getOrAssignRef(el)
       const name = getAccessibleName(el)
       const attrs = getRelevantAttrs(el)
       const styleBundle = includeStyle ? getStyleBundle(el) : ""
+      const uploadable = isUploadTarget(el)
       if (compact) {
         const nameClause = name ? `|${name}` : ""
         const attrClause = compactAttrClause(attrs)
         const styleClause = styleBundle ? `|style={${styleBundle}}` : ""
-        lines.push(`${prefix}[${refId}|${role || tag}${nameClause}${attrClause}${styleClause}]`)
+        const uploadClause = uploadable ? "|upload" : ""
+        lines.push(`${prefix}[${refId}|${role || tag}${nameClause}${attrClause}${styleClause}${uploadClause}]`)
       } else {
         const nameStr = name ? ` "${name}"` : ""
         const attrStr = attrs ? ` ${attrs}` : ""
         const styleStr = styleBundle ? ` style="${styleBundle}"` : ""
-        lines.push(`${prefix}[${refId}] ${role || tag}${nameStr}${attrStr}${styleStr}`)
+        const uploadStr = uploadable ? ` upload="interceptor upload ${refId} <path>"` : ""
+        lines.push(`${prefix}[${refId}] ${role || tag}${nameStr}${attrStr}${styleStr}${uploadStr}`)
       }
     }
 
@@ -166,13 +212,13 @@ export function buildA11yTree(
     if (shadow) {
       const shadowPrefix = compact ? ">".repeat(d + 1) : `${prefix}  `
       lines.push(`${shadowPrefix}shadow-root`)
-      for (const child of shadow.children) {
+      for (const child of Array.from(shadow.children)) {
         walk(child, d + 2)
       }
     }
 
-    for (const child of el.children) {
-      walk(child, isLandmark ? d + 1 : d)
+    for (const child of Array.from(el.children)) {
+      walk(child, isLandmark && selfVisible ? d + 1 : d)
     }
   }
 

@@ -7,8 +7,11 @@
 // State directory resolution order (first hit wins):
 //   1. action["stateDir"] passed by the CLI (per-invocation override).
 //   2. $INTERCEPTOR_VM_STATE_DIR environment variable.
-//   3. $CWD/.interceptor/vms/   (default, matches the existing
-//      .container-data/ pattern at the project root for Apple's container.)
+//   3. ~/Library/Application Support/Interceptor/   (default — a stable,
+//      writable, per-user location independent of the process CWD. The bridge
+//      runs as a launchd LaunchAgent whose CWD is "/", so the old
+//      $CWD/.interceptor default resolved to "/.interceptor" on the read-only
+//      root volume and every registry write failed with errno 30.)
 //
 // Bundle layout matches Apple's `VM.bundle` format from
 // `apple-developer-docs/Virtualization/running-macos-in-a-virtual-machine-on-apple-silicon.md:21-32`:
@@ -96,8 +99,16 @@ public actor VMRegistry {
         if let envS = ProcessInfo.processInfo.environment["INTERCEPTOR_VM_STATE_DIR"], !envS.isEmpty {
             return URL(fileURLWithPath: (envS as NSString).expandingTildeInPath)
         }
-        let cwd = FileManager.default.currentDirectoryPath
-        return URL(fileURLWithPath: cwd).appendingPathComponent(".interceptor", isDirectory: true)
+        // No override: use a stable, writable, per-user location independent of
+        // the process CWD. The bridge runs as a launchd LaunchAgent whose CWD is
+        // "/", so a $CWD-relative default resolved to "/.interceptor" on the
+        // read-only root volume. Application Support is the canonical per-user
+        // app-state directory and is writable in the agent's GUI session.
+        let appSupport = FileManager.default
+            .urls(for: .applicationSupportDirectory, in: .userDomainMask).first
+            ?? URL(fileURLWithPath: NSHomeDirectory())
+                .appendingPathComponent("Library/Application Support", isDirectory: true)
+        return appSupport.appendingPathComponent("Interceptor", isDirectory: true)
     }
 
     /// Create the directory if missing; no-op if it exists.

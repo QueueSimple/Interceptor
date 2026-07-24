@@ -79,8 +79,8 @@ final class VmDomain: DomainHandler, @unchecked Sendable {
             case "cp":         try await handleCp(action, completion: completion)
             case "share":      try await handleShare(action, completion: completion)
             case "tcc_profile_generate": try await handleTccProfileGenerate(action, completion: completion)
-            case "console", "port_forward":
-                completion(WireFormat.error("vm \(sub): pending v2 — console/port-forward require VM runtime device wiring"))
+            case "console":    try await handleConsole(action, completion: completion)
+            case "port_forward": try await handlePortForward(action, completion: completion)
             default:
                 completion(WireFormat.error("vm: unknown verb '\(sub)'"))
             }
@@ -112,6 +112,21 @@ final class VmDomain: DomainHandler, @unchecked Sendable {
             return TimeInterval(string) ?? defaultValue
         default:
             return defaultValue
+        }
+    }
+
+    private func intValue(from value: Any?) -> Int? {
+        switch value {
+        case let number as NSNumber:
+            return number.intValue
+        case let int as Int:
+            return int
+        case let double as Double:
+            return Int(double)
+        case let string as String:
+            return Int(string)
+        default:
+            return nil
         }
     }
 
@@ -173,7 +188,13 @@ final class VmDomain: DomainHandler, @unchecked Sendable {
         let spec = VMSpec(
             name: name, kind: kind, cpu: cpu, memorySize: memory, diskSize: disk,
             image: image, network: network,
-            shares: shares, rosetta: rosetta
+            shares: shares, rosetta: rosetta,
+            agent: VMGuestAgentSpec(
+                enabled: true,
+                transport: .vsock,
+                port: kInterceptorGuestAgentPort,
+                trustStatus: kind == .macos ? "transport_unverified" : "unknown"
+            )
         )
         let reg = try registry(from: action)
         let bundle = try await reg.create(spec)
@@ -200,6 +221,20 @@ final class VmDomain: DomainHandler, @unchecked Sendable {
         let modeStr = (action["mode"] as? String) ?? "clone"
         guard let mode = VMAdoptMode(rawValue: modeStr) else {
             completion(WireFormat.error("vm adopt: --mode must be clone, move, or reference")); return
+        }
+        let installAgent = (action["installAgent"] as? Bool) ?? false
+        let waitForAgent = (action["waitForAgent"] as? Bool) ?? false
+        if installAgent || waitForAgent {
+            completion([
+                "success": false,
+                "error": "vm adopt: unsupported-transport: --install-agent/--wait-for-agent require a configured macOS guest bootstrap transport; current VZ adoption cannot install or trust-probe InterceptorD safely",
+                "setup_required": [
+                    "reason": "adopt-time guest-agent install/readiness is fail-closed until macOS guest transport is explicitly configured",
+                    "command": "adopt without --install-agent/--wait-for-agent, install InterceptorD inside the guest image, then run `interceptor macos vm start \(name) --wait-for-agent`",
+                    "docs": "reports/macos-vm-agent-transport-background-2026-05-27.md",
+                ],
+            ])
+            return
         }
         let source = URL(fileURLWithPath: (sourcePath as NSString).expandingTildeInPath)
         let reg = try registry(from: action)
@@ -283,7 +318,7 @@ final class VmDomain: DomainHandler, @unchecked Sendable {
             completion(WireFormat.error("vm start: missing 'name'")); return
         }
         let headless = (action["headless"] as? Bool) ?? false
-        let waitForVsock = (action["waitForVsock"] as? Bool) ?? false
+        let waitForAgent = (action["waitForAgent"] as? Bool) ?? (action["waitForVsock"] as? Bool) ?? false
         let reg = try registry(from: action)
         let spec = try await reg.get(name)
         let bundle = await reg.bundle(for: name)
@@ -297,7 +332,7 @@ final class VmDomain: DomainHandler, @unchecked Sendable {
         let inst = VMInstance(spec: spec, bundle: bundle, status: .ready)
         putInstance(inst, name: name)
         do {
-            let r = try await inst.start(headless: headless, waitForVsock: waitForVsock)
+            let r = try await inst.start(headless: headless, waitForAgent: waitForAgent)
             // Persist startedAt
             var updated = spec
             updated.startedAt = Date()
@@ -733,29 +768,83 @@ final class VmDomain: DomainHandler, @unchecked Sendable {
         }
         let reg = try registry(from: action)
         let bundle = await reg.bundle(for: name)
-        let snapDir = bundle.snapshotDir(tag: tag)
-        let snapDisk = snapDir.appendingPathComponent("Disk.img")
-        guard FileManager.default.fileExists(atPath: snapDisk.path) else {
-            completion(WireFormat.error("vm restore: snapshot '\(tag)' has no Disk.img"))
-            return
-        }
+        let spec = try await reg.get(name)
+        let diskOnly = action["diskOnly"] as? Bool ?? false
+        let pausedStateOnly = action["pausedStateOnly"] as? Bool ?? false
+        let headless = action["headless"] as? Bool ?? true
         // Stop the VM first if running.
         if let inst = instance(for: name) {
             try? await inst.stop(force: true, timeout: 10)
             dropInstance(name: name)
         }
-        let parked = bundle.bundlePath.appendingPathComponent("Disk.img.pre-restore-\(Int(Date().timeIntervalSince1970))")
+        let inst = VMInstance(spec: spec, bundle: bundle, status: .stopped)
         do {
-            if FileManager.default.fileExists(atPath: bundle.diskPath.path) {
-                try FileManager.default.moveItem(at: bundle.diskPath, to: parked)
+            let manifest = try await inst.restoreSnapshot(
+                tag: tag,
+                diskOnly: diskOnly,
+                pausedStateOnly: pausedStateOnly,
+                headless: headless
+            )
+            let status = await inst.status
+            if status == .paused || status == .running {
+                putInstance(inst, name: name)
             }
-            try FileManager.default.copyItem(at: snapDisk, to: bundle.diskPath)
-            try? FileManager.default.removeItem(at: parked)
-            completion(WireFormat.success(["tag": tag, "restored": "disk"]))
+            completion(WireFormat.success([
+                "tag": manifest.tag,
+                "state": status.rawValue,
+                "kind": manifest.kind,
+                "hasPausedState": manifest.hasPausedState,
+                "hasDiskClone": manifest.hasDiskClone,
+                "restored": status == .paused ? "paused-state" : "disk",
+            ]))
         } catch {
-            // best-effort rollback
-            try? FileManager.default.moveItem(at: parked, to: bundle.diskPath)
             completion(WireFormat.error("vm restore: \(error)"))
+        }
+    }
+
+    private func handleConsole(_ action: [String: Any], completion: @escaping @Sendable ([String: Any]) -> Void) async throws {
+        guard let resolved = guestInstance(from: action, verb: "console", completion: completion) else { return }
+        let timeout = timeInterval(from: action["timeout"], default: 1)
+        do {
+            if let text = action["write"] as? String {
+                let bytes = try await resolved.inst.consoleWrite(text)
+                completion(WireFormat.success(["bytesWritten": bytes]))
+                return
+            }
+            let maxBytes = intValue(from: action["maxBytes"]) ?? 4096
+            let data = try await resolved.inst.consoleRead(maxBytes: maxBytes, timeout: timeout)
+            completion(WireFormat.success([
+                "bytes": data.count,
+                "text": String(data: data, encoding: .utf8) ?? "",
+                "dataBase64": data.base64EncodedString(),
+            ]))
+        } catch {
+            completion(WireFormat.error("vm console: \(error)"))
+        }
+    }
+
+    private func handlePortForward(_ action: [String: Any], completion: @escaping @Sendable ([String: Any]) -> Void) async throws {
+        guard let resolved = guestInstance(from: action, verb: "port-forward", completion: completion) else { return }
+        let hostAddress = action["hostAddress"] as? String ?? "127.0.0.1"
+        let hostPort = intValue(from: action["hostPort"]) ?? 0
+        guard let guestPort = intValue(from: action["guestPort"]) else {
+            completion(WireFormat.error("vm port-forward: missing guest port; use <hostPort>:<guestPort> or <hostAddress>:<hostPort>:<guestPort>"))
+            return
+        }
+        guard (0...65535).contains(hostPort), (1...65535).contains(guestPort) else {
+            completion(WireFormat.error("vm port-forward: ports must be in range"))
+            return
+        }
+        do {
+            let result = try await resolved.inst.portForward(hostAddress: hostAddress, hostPort: hostPort, guestPort: guestPort)
+            completion(WireFormat.success([
+                "hostAddress": result.hostAddress,
+                "hostPort": result.hostPort,
+                "guestAddress": result.guestAddress,
+                "guestPort": result.guestPort,
+            ]))
+        } catch {
+            completion(WireFormat.error("vm port-forward: \(error)"))
         }
     }
 }

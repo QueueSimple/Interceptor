@@ -23,6 +23,31 @@ public struct VMConsoleHandles: Sendable {
     public let outputPipeReadEnd: FileHandle  // host end of the guest-output pipe
 }
 
+final class VMConsoleReadContinuation: @unchecked Sendable {
+    private let lock = NSLock()
+    private var continuation: CheckedContinuation<Data, Error>?
+
+    init(_ continuation: CheckedContinuation<Data, Error>) {
+        self.continuation = continuation
+    }
+
+    func resume(returning data: Data) {
+        lock.lock()
+        let cc = continuation
+        continuation = nil
+        lock.unlock()
+        cc?.resume(returning: data)
+    }
+
+    func resume(throwing error: Error) {
+        lock.lock()
+        let cc = continuation
+        continuation = nil
+        lock.unlock()
+        cc?.resume(throwing: error)
+    }
+}
+
 public struct VMConsole: Sendable {
 #if canImport(Virtualization)
     @available(macOS 11.0, *)
@@ -46,4 +71,36 @@ public struct VMConsole: Sendable {
         return (serial, handles)
     }
 #endif
+
+    public static func read(
+        from handle: FileHandle,
+        maxBytes: Int,
+        timeout: TimeInterval
+    ) async throws -> Data {
+        let bytes = max(1, maxBytes)
+        return try await withCheckedThrowingContinuation { cc in
+            let gate = VMConsoleReadContinuation(cc)
+            let source = DispatchSource.makeReadSource(fileDescriptor: handle.fileDescriptor, queue: .global(qos: .utility))
+            source.setEventHandler {
+                let available = Int(source.data)
+                let count = min(bytes, max(1, available))
+                let data = handle.readData(ofLength: count)
+                source.cancel()
+                gate.resume(returning: data)
+            }
+            source.setCancelHandler {}
+            source.resume()
+            if timeout > 0 {
+                DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + timeout) {
+                    source.cancel()
+                    gate.resume(returning: Data())
+                }
+            }
+        }
+    }
+
+    public static func write(_ data: Data, to handle: FileHandle) throws -> Int {
+        try handle.write(contentsOf: data)
+        return data.count
+    }
 }

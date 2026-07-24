@@ -101,9 +101,19 @@ final class VMRegistryTests: XCTestCase {
         XCTAssertEqual(resolved.path, "/tmp/from-env")
     }
 
-    func test_resolveStateDir_cwdDefault() {
+    func test_resolveStateDir_appSupportDefault() {
+        // No override and no env var → a stable per-user Application Support
+        // path, independent of CWD. The bridge LaunchAgent's CWD is "/", so the
+        // old $CWD/.interceptor default resolved to "/.interceptor" on the
+        // read-only root volume and every registry write failed.
+        unsetenv("INTERCEPTOR_VM_STATE_DIR")
         let resolved = VMRegistry.resolveStateDir(actionOverride: nil)
-        XCTAssertTrue(resolved.path.hasSuffix("/.interceptor"))
+        XCTAssertTrue(
+            resolved.path.hasSuffix("/Library/Application Support/Interceptor"),
+            "expected Application Support default, got \(resolved.path)")
+        XCTAssertFalse(
+            resolved.path.hasPrefix("/.interceptor"),
+            "must not resolve to a CWD-relative root path")
     }
 
     func test_create_then_get_roundtrip() async throws {
@@ -176,6 +186,12 @@ final class VMRegistryTests: XCTestCase {
 }
 
 final class VmDomainDispatchTests: XCTestCase {
+    private func makeTmpStateDir(_ prefix: String = "interceptor-vm-domain") -> URL {
+        let url = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("\(prefix)-\(UUID().uuidString)", isDirectory: true)
+        try? FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+        return url
+    }
 
     func test_unknownVerb_returnsError() async {
         let domain = VmDomain()
@@ -200,12 +216,50 @@ final class VmDomainDispatchTests: XCTestCase {
         XCTAssertEqual(result["success"] as? Bool, false)
     }
 
+    func test_adoptInstallAgentFlagsFailClosedBeforeImport() async throws {
+        let stateDir = makeTmpStateDir()
+        defer { try? FileManager.default.removeItem(at: stateDir) }
+        let domain = VmDomain()
+        let action: [String: Any] = [
+            "type": "macos_vm_adopt",
+            "sub": "adopt",
+            "name": "gold",
+            "sourcePath": "/tmp/nonexistent-gold",
+            "kind": "macos",
+            "provider": "auto",
+            "mode": "clone",
+            "installAgent": true,
+            "waitForAgent": true,
+            "stateDir": stateDir.path,
+        ]
+        let result = await withCheckedContinuation { (cc: CheckedContinuation<TestDictBox, Never>) in
+            domain.handle("adopt", action: action) { result in
+                cc.resume(returning: TestDictBox(d: result))
+            }
+        }.d
+
+        XCTAssertEqual(result["success"] as? Bool, false)
+        XCTAssertTrue((result["error"] as? String ?? "").contains("unsupported-transport"))
+        XCTAssertNotNil(result["setup_required"])
+
+        let registry = try VMRegistry(stateDir: stateDir)
+        await self.expectAsyncThrow(try await registry.get("gold"))
+    }
+
     func test_pull_resolvesPathDeterministically() async throws {
-        let stateDir = URL(fileURLWithPath: NSTemporaryDirectory())
-            .appendingPathComponent("interceptor-vm-pull-\(UUID().uuidString)", isDirectory: true)
+        let stateDir = makeTmpStateDir("interceptor-vm-pull")
         defer { try? FileManager.default.removeItem(at: stateDir) }
         let url1 = try await VMImage.resolveOCIImage(ref: "docker.io/library/alpine:3", stateDir: stateDir)
         let url2 = try await VMImage.resolveOCIImage(ref: "docker.io/library/alpine:3", stateDir: stateDir)
         XCTAssertEqual(url1.path, url2.path)
+    }
+
+    private func expectAsyncThrow<T>(_ expr: @autoclosure () async throws -> T, file: StaticString = #filePath, line: UInt = #line) async {
+        do {
+            _ = try await expr()
+            XCTFail("expected throw", file: file, line: line)
+        } catch {
+            // ok
+        }
     }
 }

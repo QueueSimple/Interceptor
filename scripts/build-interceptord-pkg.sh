@@ -11,6 +11,8 @@ UNSIGNED_PKG="$OUT_DIR/InterceptorD-${VERSION}-unsigned.pkg"
 INTERCEPTOR_SIGNING_IDENTITY="${INTERCEPTOR_SIGNING_IDENTITY:-Developer ID Application: HACKER VALLEY MEDIA, LLC (TPWBZD35WW)}"
 INTERCEPTOR_INSTALLER_IDENTITY="${INTERCEPTOR_INSTALLER_IDENTITY:-Developer ID Installer: HACKER VALLEY MEDIA, LLC (TPWBZD35WW)}"
 
+export COPYFILE_DISABLE=1
+
 mkdir -p "$OUT_DIR"
 
 cd "$BRIDGE_DIR"
@@ -65,6 +67,8 @@ if [[ "${INTERCEPTOR_SKIP_SIGNING:-0}" != "1" ]] && security find-identity -v 2>
 fi
 
 rm -f "$PKG" "$UNSIGNED_PKG"
+
+xattr -cr "$STAGE" 2>/dev/null || true
 
 pkgbuild \
   --root "$STAGE" \

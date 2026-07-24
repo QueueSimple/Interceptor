@@ -50,6 +50,7 @@ public actor VMInstance {
     // Held only when running. Cleared on stop.
     private var linuxRuntime: LinuxRuntimeHandle?
     private var guestAgent: (any GuestAgent)?
+    private var portForwarders: [String: VMPortForwarder] = [:]
 
 #if canImport(Virtualization)
     private var macVM: MacRunningVM?
@@ -62,8 +63,8 @@ public actor VMInstance {
     }
 
     /// `vm start` — boot the guest. Transitions ready → starting → running.
-    /// `waitForVsock` blocks the start call until the guest agent connects.
-    public func start(headless: Bool, waitForVsock: Bool) async throws -> VMStartResult {
+    /// `waitForAgent` blocks the start call until the guest agent connects.
+    public func start(headless: Bool, waitForAgent: Bool) async throws -> VMStartResult {
         let begin = Date()
         switch status {
         case .running, .paused, .starting, .stopping, .savingSnapshot, .restoringSnapshot:
@@ -98,32 +99,44 @@ public actor VMInstance {
                         }
                     }
                     macVM = mvm
-                    ipAddress = await Self.waitForBridge100IPAddress(macAddress: mvm.macAddress, timeout: waitForVsock ? 30 : 3)
+                    ipAddress = await Self.waitForBridge100IPAddress(macAddress: mvm.macAddress, timeout: waitForAgent ? 30 : 3)
                     let fallbackIPAddress = ipAddress
+                    let agentSpec = spec.agent
+                    let agentEnabled = agentSpec?.enabled ?? true
+                    let agentPort = agentSpec?.port ?? kInterceptorGuestAgentPort
+                    let tcpFallbackHost = agentSpec?.transport == .tcp ? (agentSpec?.host ?? fallbackIPAddress) : nil
                     // GuestAgent (vsock) attach. The first socketDevice is
-                    // the one we configured in MacRuntime.run.
+                    // the one we configured in MacRuntime.run. TCP fallback is
+                    // only enabled when VMSpec.agent explicitly requests TCP.
                     let agent: VsockGuestAgent? = await withCheckedContinuation { cc in
                         mvm.queue.async {
                             let socketDevice = mvm.vm.socketDevices.first as? VZVirtioSocketDevice
-                            cc.resume(returning: socketDevice.map { VsockGuestAgent(socketDevice: $0, connectQueue: mvm.queue, tcpFallbackHost: fallbackIPAddress) })
+                            cc.resume(returning: socketDevice.map {
+                                VsockGuestAgent(
+                                    socketDevice: $0,
+                                    connectQueue: mvm.queue,
+                                    port: agentPort,
+                                    tcpFallbackHost: tcpFallbackHost
+                                )
+                            })
                         }
                     }
-                    if let agent {
-                        if waitForVsock {
+                    if agentEnabled, let agent {
+                        if waitForAgent {
                             do {
                                 try await agent.connect(timeout: 60)
                                 self.guestAgent = agent
                             } catch {
-                                // boot succeeded; agent not up — still
-                                // a running VM. Keep the agent handle so
-                                // later guest verbs can retry after login
-                                // items / LaunchAgents finish starting.
                                 self.guestAgent = agent
-                                self.lastError = "vsock connect: \(error.localizedDescription)"
+                                self.lastError = "guest agent connect: \(error)"
+                                throw VMInstanceError.runtimeUnavailable("guest agent readiness failed: \(error)")
                             }
                         } else {
                             self.guestAgent = agent  // lazy connect on first use
                         }
+                    } else if waitForAgent {
+                        let transport = agentSpec?.transport.rawValue ?? "vsock"
+                        throw VMInstanceError.runtimeUnavailable("guest agent transport '\(transport)' is not available for VM '\(spec.name)'")
                     }
                 } else {
                     throw VMInstanceError.runtimeUnavailable("macOS guests require macOS 13+ host")
@@ -161,6 +174,10 @@ public actor VMInstance {
         // tear down agent
         await guestAgent?.disconnect()
         guestAgent = nil
+        for forwarder in portForwarders.values {
+            forwarder.stop()
+        }
+        portForwarders.removeAll()
         linuxRuntime = nil
         #if canImport(Virtualization)
         macVM = nil
@@ -243,7 +260,11 @@ public actor VMInstance {
             if ipAddress == nil {
                 ipAddress = await Self.waitForBridge100IPAddress(macAddress: macVM?.macAddress, timeout: 5)
             }
-            vsockAgent.setTCPFallbackHost(ipAddress)
+            if spec.agent?.transport == .tcp {
+                vsockAgent.setTCPFallbackHost(spec.agent?.host ?? ipAddress)
+            } else {
+                vsockAgent.setTCPFallbackHost(nil)
+            }
         }
         #endif
         try await agent.connect(timeout: min(timeout, 30))
@@ -260,6 +281,97 @@ public actor VMInstance {
         }
         #endif
         throw VMInstanceError.runtimeUnavailable("paused-state snapshots require macOS 14+ and a running macOS VM")
+    }
+
+    public func restoreSnapshot(tag: String, diskOnly: Bool, pausedStateOnly: Bool, headless: Bool) async throws -> VMSnapshotManifest {
+        guard status != .running && status != .paused && status != .starting && status != .stopping else {
+            throw VMInstanceError.invalidTransition("restore requires VM '\(spec.name)' to be stopped")
+        }
+        status = .restoringSnapshot
+        do {
+            let manifest = try VMSnapshot.manifest(bundle: bundle, tag: tag)
+            if diskOnly && !manifest.hasDiskClone {
+                throw VMSnapshotError.missing("snapshot '\(tag)' has no Disk.img")
+            }
+            if pausedStateOnly && !manifest.hasPausedState {
+                throw VMSnapshotError.missing("snapshot '\(tag)' has no paused machine state")
+            }
+            if !pausedStateOnly && manifest.hasDiskClone {
+                _ = try VMSnapshot.restoreDisk(bundle: bundle, tag: tag)
+            }
+            if diskOnly || !manifest.hasPausedState {
+                status = .stopped
+                return manifest
+            }
+
+            guard spec.kind == .macos else {
+                throw VMInstanceError.runtimeUnavailable("paused-state restore is only wired for macOS VZ guests")
+            }
+            #if canImport(Virtualization)
+            if #available(macOS 14.0, *) {
+                let mvm = try await MacRuntime.run(spec: spec, bundle: bundle, headless: headless)
+                _ = try await VMSnapshot.restorePausedState(vm: mvm.vm, bundle: bundle, tag: tag)
+                macVM = mvm
+                status = .paused
+                return manifest
+            }
+            #endif
+            throw VMInstanceError.runtimeUnavailable("paused-state restore requires macOS 14+ host with Virtualization.framework")
+        } catch {
+            status = .error
+            lastError = "\(error)"
+            throw error
+        }
+    }
+
+    public func consoleRead(maxBytes: Int, timeout: TimeInterval) async throws -> Data {
+        guard status == .running || status == .paused else {
+            throw VMInstanceError.notStarted("vm '\(spec.name)' is .\(status.rawValue)")
+        }
+        #if canImport(Virtualization)
+        if let handle = macVM?.consoleHandles?.outputPipeReadEnd {
+            return try await VMConsole.read(from: handle, maxBytes: maxBytes, timeout: timeout)
+        }
+        #endif
+        throw VMInstanceError.runtimeUnavailable("console is only available for VZ guests with a serial attachment")
+    }
+
+    public func consoleWrite(_ text: String) async throws -> Int {
+        guard status == .running || status == .paused else {
+            throw VMInstanceError.notStarted("vm '\(spec.name)' is .\(status.rawValue)")
+        }
+        #if canImport(Virtualization)
+        if let handle = macVM?.consoleHandles?.inputPipeWriteEnd {
+            return try VMConsole.write(Data(text.utf8), to: handle)
+        }
+        #endif
+        throw VMInstanceError.runtimeUnavailable("console is only available for VZ guests with a serial attachment")
+    }
+
+    public func portForward(hostAddress: String, hostPort: Int, guestPort: Int) async throws -> (hostAddress: String, hostPort: Int, guestAddress: String, guestPort: Int) {
+        guard status == .running else {
+            throw VMInstanceError.notStarted("vm '\(spec.name)' is .\(status.rawValue)")
+        }
+        if ipAddress == nil {
+            #if canImport(Virtualization)
+            if #available(macOS 13.0, *) {
+                ipAddress = await Self.waitForBridge100IPAddress(macAddress: macVM?.macAddress, timeout: 5)
+            }
+            #endif
+        }
+        guard let guestAddress = ipAddress, !guestAddress.isEmpty else {
+            throw VMInstanceError.runtimeUnavailable("cannot start port-forward without a known guest IPv4 address")
+        }
+        let forwarder = VMPortForwarder(
+            hostAddress: hostAddress,
+            hostPort: hostPort,
+            guestAddress: guestAddress,
+            guestPort: guestPort
+        )
+        let actualHostPort = try forwarder.start()
+        let key = "\(hostAddress):\(actualHostPort)->\(guestAddress):\(guestPort)"
+        portForwarders[key] = forwarder
+        return (hostAddress, actualHostPort, guestAddress, guestPort)
     }
 
     public func current() -> VMSpec { spec }

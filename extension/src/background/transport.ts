@@ -2,8 +2,10 @@ import { handleDaemonMessage, drainMessageQueue, pendingRequests } from "./messa
 import { safeNativePortDisconnect, safeNativePortPing, safeNativePortPost, shouldSkipNativeKeepalive } from "./native-port-lifecycle"
 import { recoverPendingRequestsAfterNativeDisconnect } from "./pending-request-recovery"
 import { INITIAL_RECONNECT_DELAY_MS, delayWithJitter, nextReconnectDelay } from "./reconnect-lifecycle"
+import { clearContextConflictBadge, registrationControlType, setContextConflictBadge } from "./context-registration"
+import { SafariNativeRelayClient, type SafariNativeRelayRuntime } from "./safari-native-relay"
 
-type ActiveTransport = "none" | "native" | "websocket"
+type ActiveTransport = "none" | "native" | "websocket" | "safari-native"
 export type HostDeliveryResult = "sent" | "queued" | "failed"
 
 export let nativePort: chrome.runtime.Port | null = null
@@ -21,10 +23,29 @@ let keepalivePongTimer: ReturnType<typeof setTimeout> | null = null
 let pendingHandshakePort: chrome.runtime.Port | null = null
 let lastNativeActivityAt = 0
 const WS_URL = "ws://localhost:19222"
+let configuredContextId: string | null = null
+let forceWebSocketTransport = false
+let safariNativeRelayEnabled = false
+let safariNativeRelayClient: SafariNativeRelayClient | null = null
 export const NATIVE_KEEPALIVE_PONG_TIMEOUT_MS = 15_000
 export const RECENT_NATIVE_ACTIVITY_GRACE_MS = 10_000
 const OUTBOUND_RECOVERY_QUEUE_CAP = 50
 const outboundRecoveryQueue: unknown[] = []
+
+export type ExtensionTransportConfig = {
+  contextId?: string
+  forceWebSocket?: boolean
+  safariNativeRelay?: boolean
+}
+
+/** Configure an entrypoint before it registers listeners or opens a channel. */
+export function configureTransport(config: ExtensionTransportConfig): void {
+  if (typeof config.contextId === "string" && config.contextId.trim().length > 0) {
+    configuredContextId = config.contextId.trim()
+  }
+  forceWebSocketTransport = config.forceWebSocket === true
+  safariNativeRelayEnabled = config.safariNativeRelay === true
+}
 
 function describeOutboundMessage(msg: unknown): string {
   const candidate = msg as { id?: unknown; result?: { error?: unknown } } | null
@@ -35,7 +56,7 @@ function describeOutboundMessage(msg: unknown): string {
   return JSON.stringify(msg).slice(0, 200)
 }
 
-function emitEvent(event: string, data: Record<string, unknown> = {}) {
+export function emitEvent(event: string, data: Record<string, unknown> = {}) {
   sendToHost({ type: "event", event, ...data })
 }
 
@@ -55,6 +76,16 @@ function disconnectNativePort(port: chrome.runtime.Port | null): void {
   clearNativeStateFor(port)
 }
 
+function hasNativeMessaging(): boolean {
+  // Some extension hosts expose connectNative with semantics that do not target
+  // our Chromium native host. Entrypoints may explicitly select plain WebSocket;
+  // Safari's selected native-relay path is handled before this predicate.
+  if (forceWebSocketTransport) return false
+  // Keep the generated MV2/Electron bootstrap global as a compatibility path.
+  if ((globalThis as { INTERCEPTOR_FORCE_WS?: unknown }).INTERCEPTOR_FORCE_WS) return false
+  return typeof chrome.runtime.connectNative === "function"
+}
+
 function postNative(msg: unknown, port = nativePort): boolean {
   if (!port) return false
   const res = safeNativePortPost(port, msg)
@@ -70,6 +101,24 @@ function isWsOpen(): boolean {
   return true
 }
 
+function markWsUnregistered(): void {
+  wsReady = false
+  if (activeTransport === "websocket") activeTransport = "none"
+}
+
+function markWsRegistered(): void {
+  wsReady = true
+  clearContextConflictBadge(chrome)
+  if (activeTransport !== "native") {
+    activeTransport = "websocket"
+    wsReconnectDelay = INITIAL_RECONNECT_DELAY_MS
+    isConnecting = false
+    console.log("connection ready via ws channel")
+    drainMessageQueue()
+  }
+  drainOutboundRecoveryQueue()
+}
+
 function sendWs(msg: unknown): boolean {
   const channel = wsChannel
   if (!wsReady || !channel || channel.readyState !== WebSocket.OPEN) return false
@@ -79,6 +128,26 @@ function sendWs(msg: unknown): boolean {
   } catch {
     return false
   }
+}
+
+function sendWsRegistration(ws: WebSocket, contextId: string): boolean {
+  markWsUnregistered()
+  try {
+    ws.send(JSON.stringify({ type: "extension", contextId }))
+    return true
+  } catch (err) {
+    console.error("ws context registration send error:", err)
+    return false
+  }
+}
+
+function closeWsForReconnect(ws: WebSocket): void {
+  try { ws.close() } catch {}
+  if (wsChannel !== ws) return
+  stopWsKeepAlive()
+  markWsUnregistered()
+  wsChannel = null
+  scheduleWsReconnect()
 }
 
 function enqueueOutboundRecovery(msg: unknown): HostDeliveryResult {
@@ -99,6 +168,14 @@ function drainOutboundRecoveryQueue(): void {
 }
 
 export function sendToHost(msg: unknown, forceWs?: boolean, allowQueue = false): HostDeliveryResult {
+  if (safariNativeRelayEnabled) {
+    connectSafariNativeRelayChannel()
+    if (!safariNativeRelayClient) {
+      return allowQueue ? enqueueOutboundRecovery(msg) : "failed"
+    }
+    safariNativeRelayClient.enqueue(msg)
+    return "queued"
+  }
   if (forceWs) {
     if (sendWs(msg)) return "sent"
     return allowQueue ? enqueueOutboundRecovery(msg) : "failed"
@@ -144,6 +221,15 @@ function scheduleNativeReconnect(): void {
 }
 
 export function connectToHost(): void {
+  if (safariNativeRelayEnabled) {
+    connectSafariNativeRelayChannel()
+    return
+  }
+  if (!hasNativeMessaging()) {
+    if (isWsOpen()) activeTransport = "websocket"
+    else connectWsChannel()
+    return
+  }
   if (nativePort || isConnecting) return
   isConnecting = true
 
@@ -223,6 +309,76 @@ export function connectToHost(): void {
   }
 }
 
+function handleControlPlaneMessage(
+  rawMessage: unknown,
+  transport: "websocket" | "safari-native",
+): void {
+  if (!rawMessage || typeof rawMessage !== "object") return
+  const msg = rawMessage as {
+    id?: string
+    type?: string
+    contextId?: string
+    action?: { type: string; [key: string]: unknown }
+    tabId?: number
+    _viaWs?: boolean
+  }
+  const controlType = registrationControlType(msg)
+  if (controlType === "context_conflict") {
+    if (transport === "websocket") markWsUnregistered()
+    else if (activeTransport === "safari-native") activeTransport = "none"
+    console.error(`[interceptor] context name conflict: '${msg.contextId}' is already registered. Change the context ID in the extension popup.`)
+    setContextConflictBadge(chrome)
+    return
+  }
+  if (controlType === "context_registered") {
+    if (transport === "websocket") {
+      markWsRegistered()
+    } else {
+      activeTransport = "safari-native"
+      clearContextConflictBadge(chrome)
+      drainMessageQueue()
+      while (outboundRecoveryQueue.length > 0) {
+        safariNativeRelayClient?.enqueue(outboundRecoveryQueue.shift())
+      }
+    }
+    return
+  }
+  if (msg.id && msg.action) {
+    // The daemon-facing leg is still its WebSocket; responses must return over
+    // the same connection even though JS reaches it through the native appex.
+    msg._viaWs = true
+    void handleDaemonMessage(msg)
+  }
+}
+
+export function connectSafariNativeRelayChannel(): void {
+  if (!safariNativeRelayEnabled) return
+  if (safariNativeRelayClient) {
+    safariNativeRelayClient.start()
+    return
+  }
+  const contextId = configuredContextId
+  if (!contextId) {
+    console.error("Safari native relay requires an explicit context id")
+    return
+  }
+  const runtime = (chrome as unknown as { runtime?: SafariNativeRelayRuntime }).runtime
+  if (!runtime) {
+    console.error("Safari native relay requires chrome.runtime")
+    return
+  }
+  safariNativeRelayClient = new SafariNativeRelayClient({
+    runtime,
+    contextId,
+    onMessage: (message) => handleControlPlaneMessage(message, "safari-native"),
+    onConnectionChange: (connected) => {
+      if (!connected && activeTransport === "safari-native") activeTransport = "none"
+    },
+    onError: (error) => console.error("Safari native relay:", error.message),
+  })
+  safariNativeRelayClient.start()
+}
+
 function startWsKeepAlive(): void {
   if (wsKeepAliveTimer) clearInterval(wsKeepAliveTimer)
   wsKeepAliveTimer = setInterval(() => {
@@ -241,74 +397,85 @@ function stopWsKeepAlive(): void {
 }
 
 async function getOrCreateContextId(): Promise<string> {
-  const stored = await chrome.storage.local.get("contextId") as { contextId?: string }
-  if (stored.contextId) return stored.contextId
+  const legacyConfigured = (globalThis as { INTERCEPTOR_APP_CONTEXT_ID?: unknown }).INTERCEPTOR_APP_CONTEXT_ID
+  const configured = configuredContextId ?? legacyConfigured
+  const storage = (chrome as unknown as {
+    storage?: { local?: Pick<typeof chrome.storage.local, "get" | "set"> }
+  }).storage?.local
+  if (typeof configured === "string" && configured.length > 0) {
+    // The fixed Safari identity is sufficient to register. Storage is only a
+    // convenience here and must not become a control-plane dependency.
+    try { await storage?.set({ contextId: configured }) } catch {}
+    return configured
+  }
+  const stored = storage
+    ? await storage.get("contextId") as { contextId?: string }
+    : {}
+  if (stored?.contextId) return stored.contextId
   const id = crypto.randomUUID()
-  await chrome.storage.local.set({ contextId: id })
+  try { await storage?.set({ contextId: id }) } catch {}
   return id
 }
 
 export function connectWsChannel(): void {
+  if (safariNativeRelayEnabled) {
+    connectSafariNativeRelayChannel()
+    return
+  }
   if (wsChannel && (wsChannel.readyState === WebSocket.OPEN || wsChannel.readyState === WebSocket.CONNECTING)) return
   try {
     const ws = new WebSocket(WS_URL)
+    wsChannel = ws
     ws.onopen = async () => {
-      wsChannel = ws
-      wsReady = true
+      if (wsChannel !== ws) {
+        try { ws.close() } catch {}
+        return
+      }
+      markWsUnregistered()
       if (wsReconnectTimer) {
         clearTimeout(wsReconnectTimer)
         wsReconnectTimer = null
       }
       startWsKeepAlive()
       const contextId = await getOrCreateContextId()
-      if (ws.readyState !== WebSocket.OPEN) return
-      try {
-        ws.send(JSON.stringify({ type: "extension", contextId }))
-      } catch (err) {
-        console.error("ws handshake send error:", err)
-        ws.close()
+      if (wsChannel !== ws) {
+        try { ws.close() } catch {}
         return
       }
-      console.log("ws channel connected")
-      if (activeTransport !== "native") {
-        activeTransport = "websocket"
-        wsReconnectDelay = INITIAL_RECONNECT_DELAY_MS
-        isConnecting = false
-        console.log("connection ready via ws channel")
-        drainMessageQueue()
+      if (ws.readyState !== WebSocket.OPEN) return
+      if (!sendWsRegistration(ws, contextId)) {
+        closeWsForReconnect(ws)
+        return
       }
-      drainOutboundRecoveryQueue()
+      console.log("ws channel connected; context registration requested")
     }
     ws.onmessage = (event) => {
+      if (wsChannel !== ws) return
       try {
         const msg = JSON.parse(typeof event.data === "string" ? event.data : "")
         console.log("ws onmessage:", JSON.stringify(msg).slice(0, 200))
-        if (msg.id && msg.action) {
-          msg._viaWs = true
-          handleDaemonMessage(msg)
-        }
+        handleControlPlaneMessage(msg, "websocket")
       } catch (err) {
         console.error("ws onmessage error:", err)
       }
     }
     ws.onclose = () => {
+      if (wsChannel !== ws) return
       stopWsKeepAlive()
-      wsReady = false
+      markWsUnregistered()
       wsChannel = null
-      if (activeTransport === "websocket") activeTransport = "none"
       scheduleWsReconnect()
     }
     ws.onerror = () => {
+      if (wsChannel !== ws) return
       stopWsKeepAlive()
-      wsReady = false
+      markWsUnregistered()
       wsChannel = null
-      if (activeTransport === "websocket") activeTransport = "none"
       scheduleWsReconnect()
     }
   } catch {
-    wsReady = false
+    markWsUnregistered()
     wsChannel = null
-    if (activeTransport === "websocket") activeTransport = "none"
     scheduleWsReconnect()
   }
 }
@@ -317,7 +484,11 @@ export function connectWsChannel(): void {
 let lastSwKeepalive = 0
 
 export function registerSwKeepaliveListener(): void {
-  chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
+  const onMessage = (chrome as unknown as {
+    runtime?: { onMessage?: typeof chrome.runtime.onMessage }
+  }).runtime?.onMessage
+  if (!onMessage?.addListener) return
+  onMessage.addListener((msg, _sender, sendResponse) => {
     if (msg.type !== "sw_keepalive") return false
     const now = Date.now()
     if (now - lastSwKeepalive < 20_000) {
@@ -331,22 +502,30 @@ export function registerSwKeepaliveListener(): void {
 }
 
 export function registerStorageContextListener(): void {
-  chrome.storage.onChanged.addListener((changes, area) => {
+  const onChanged = (chrome as unknown as {
+    storage?: { onChanged?: typeof chrome.storage.onChanged }
+  }).storage?.onChanged
+  if (!onChanged?.addListener) return
+  onChanged.addListener((changes, area) => {
     if (area !== "local" || !changes.contextId) return
     const newId = changes.contextId.newValue
     if (typeof newId !== "string" || newId.length === 0) return
     if (!newId || !wsChannel || wsChannel.readyState !== WebSocket.OPEN) return
-    try {
-      wsChannel.send(JSON.stringify({ type: "extension", contextId: newId }))
-    } catch (err) {
-      console.error("ws context re-register error:", err)
+    const channel = wsChannel
+    if (!sendWsRegistration(channel, newId)) {
+      closeWsForReconnect(channel)
     }
   })
 }
 
 export function registerAlarmListener(): void {
-  chrome.alarms.create("keepalive", { periodInMinutes: 0.5 })
-  chrome.alarms.onAlarm.addListener((alarm) => {
+  const alarms = (chrome as unknown as { alarms?: typeof chrome.alarms }).alarms
+  if (typeof alarms?.create !== "function" || !alarms.onAlarm?.addListener) return
+  const creation = alarms.create("keepalive", { periodInMinutes: 1 })
+  if (creation && typeof (creation as Promise<void>).catch === "function") {
+    ;(creation as Promise<void>).catch((err) => console.warn("keepalive alarm unavailable:", err))
+  }
+  alarms.onAlarm.addListener((alarm) => {
     if (alarm.name !== "keepalive") return
     if (!nativePort) connectToHost()
     if (!wsChannel || wsChannel.readyState === WebSocket.CLOSED) connectWsChannel()

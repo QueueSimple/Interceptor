@@ -157,7 +157,55 @@ public struct VMSnapshot: Sendable {
 
         return manifest
     }
+
+    @available(macOS 14.0, *)
+    public static func restorePausedState(
+        vm: VZVirtualMachine,
+        bundle: VMBundle,
+        tag: String
+    ) async throws -> VMSnapshotManifest {
+        let manifest = try manifest(bundle: bundle, tag: tag)
+        guard manifest.hasPausedState else {
+            throw VMSnapshotError.missing("snapshot '\(tag)' has no paused machine state")
+        }
+        let saveURL = bundle.snapshotFile(tag: tag)
+        do {
+            try await vm.restoreMachineStateFrom(url: saveURL)
+        } catch {
+            throw VMSnapshotError.ioFailure("restoreMachineStateFrom: \(error.localizedDescription)")
+        }
+        return manifest
+    }
 #endif
+
+    public static func manifest(bundle: VMBundle, tag: String) throws -> VMSnapshotManifest {
+        let manifestURL = bundle.snapshotManifest(tag: tag)
+        guard FileManager.default.fileExists(atPath: manifestURL.path) else {
+            throw VMSnapshotError.missing("snapshot '\(tag)' not found at \(manifestURL.path)")
+        }
+        return try readManifest(at: manifestURL)
+    }
+
+    public static func restoreDisk(bundle: VMBundle, tag: String) throws -> VMSnapshotManifest {
+        let manifest = try manifest(bundle: bundle, tag: tag)
+        guard manifest.hasDiskClone else {
+            throw VMSnapshotError.missing("snapshot '\(tag)' has no Disk.img")
+        }
+        let snapDisk = bundle.snapshotDir(tag: tag).appendingPathComponent("Disk.img")
+        let liveDisk = bundle.diskPath
+        let parked = bundle.bundlePath.appendingPathComponent("Disk.img.pre-restore-\(Int(Date().timeIntervalSince1970))")
+        if FileManager.default.fileExists(atPath: liveDisk.path) {
+            try? FileManager.default.moveItem(at: liveDisk, to: parked)
+        }
+        do {
+            try FileManager.default.copyItem(at: snapDisk, to: liveDisk)
+            try? FileManager.default.removeItem(at: parked)
+        } catch {
+            try? FileManager.default.moveItem(at: parked, to: liveDisk)
+            throw VMSnapshotError.ioFailure("restore Disk.img: \(error.localizedDescription)")
+        }
+        return manifest
+    }
 
     public static func list(bundle: VMBundle) -> [String] {
         let snapsDir = bundle.snapshotsDir

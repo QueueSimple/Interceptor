@@ -49,12 +49,14 @@ public final class MacRunningVM: @unchecked Sendable {
     public let queue: DispatchQueue
     public let delegate: MacVMDelegate
     public let macAddress: String?
+    public let consoleHandles: VMConsoleHandles?
 
-    init(vm: VZVirtualMachine, queue: DispatchQueue, delegate: MacVMDelegate, macAddress: String?) {
+    init(vm: VZVirtualMachine, queue: DispatchQueue, delegate: MacVMDelegate, macAddress: String?, consoleHandles: VMConsoleHandles?) {
         self.vm = vm
         self.queue = queue
         self.delegate = delegate
         self.macAddress = macAddress
+        self.consoleHandles = consoleHandles
     }
 }
 
@@ -240,6 +242,8 @@ public struct MacRuntime: Sendable {
         config.networkDevices = networkDevices
         config.entropyDevices = [VZVirtioEntropyDeviceConfiguration()]
         config.socketDevices = [VZVirtioSocketDeviceConfiguration()]  // for guest agent
+        let console = VMConsole.buildSerialPort()
+        config.serialPorts = [console.config]
         if let shares = try? VMShare.buildDirectorySharingDevices(for: spec) {
             config.directorySharingDevices = shares
         }
@@ -260,7 +264,13 @@ public struct MacRuntime: Sendable {
         let delegate = MacVMDelegate()
         vm.delegate = delegate
 
-        return MacRunningVM(vm: vm, queue: queue, delegate: delegate, macAddress: networkDevices.first?.macAddress.string)
+        return MacRunningVM(
+            vm: vm,
+            queue: queue,
+            delegate: delegate,
+            macAddress: networkDevices.first?.macAddress.string,
+            consoleHandles: console.handles
+        )
     }
 
     /// Create a sparse-file-backed disk image of the given size. The
