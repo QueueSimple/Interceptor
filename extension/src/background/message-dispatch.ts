@@ -130,7 +130,13 @@ export async function handleDaemonMessage(msg: {
       sendToHost({ id: msg.id, result: { success: false, error: `tab ${guardTarget} does not exist` } }, respondViaWs)
       return
     }
-    if (!inGroup && interceptorGroupId !== null) {
+    // Destructive actions are deny-by-default: closing a tab that isn't
+    // managed requires the explicit anyTab opt-in even when no interceptor
+    // group exists yet — otherwise a fresh session could close user tabs.
+    // Non-destructive actions keep the permissive no-group default so the
+    // tool can bootstrap (read/navigate before any managed tab exists).
+    const destructive = action.type === "tab_close"
+    if (!inGroup && (interceptorGroupId !== null || destructive)) {
       clearTimeout(requestTimer)
       pendingRequests.delete(msg.id)
       sendToHost({

@@ -35,7 +35,7 @@ Compound (agent-optimized):
   interceptor open <url> --full              Full text instead of 2000-char summary
   interceptor open <url> --timeout <ms>      Override wait-stable timeout (default 5000)
   interceptor open <url> --no-wait           Return immediately after tab creation
-  interceptor open <url> --reuse             Navigate the most recent Interceptor-group tab instead of opening a new one (cleans up long automation runs)
+  interceptor open <url> --reuse             Navigate the most recently created Interceptor-group tab (highest tab id) instead of opening a new one
   interceptor open <url> --reuse --activate  Navigate the reused tab and bring it to the foreground
   interceptor read                           Tree + text for active tab
   interceptor read <ref>                     Tree + text for element subtree

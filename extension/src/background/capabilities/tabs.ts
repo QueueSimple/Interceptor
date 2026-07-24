@@ -25,20 +25,29 @@ export async function handleTabActions(
               .sort((a, b) => (b.id as number) - (a.id as number))
             const candidate = sorted[0]
             if (candidate?.id !== undefined) {
+              // Reuse path: preserve the candidate tab's current
+              // active/inactive state by default — navigating a background
+              // tab keeps it in the background, a foreground tab stays
+              // foreground. Only pass `active: true` when the caller
+              // explicitly asked for activation via `action.active`, so
+              // `interceptor open <url> --reuse --activate` foregrounds
+              // the reused tab on demand without disturbing the user's
+              // focus on every routine reuse call.
+              const reuseActivate = (action.active as boolean | undefined) === true
+              const updateProps: chrome.tabs.UpdateProperties = { url: targetUrl }
+              if (reuseActivate) updateProps.active = true
+              let updated: chrome.tabs.Tab | undefined
               try {
-                // Reuse path: preserve the candidate tab's current
-                // active/inactive state by default — navigating a background
-                // tab keeps it in the background, a foreground tab stays
-                // foreground. Only pass `active: true` when the caller
-                // explicitly asked for activation via `action.active`, so
-                // `interceptor open <url> --reuse --activate` foregrounds
-                // the reused tab on demand without disturbing the user's
-                // focus on every routine reuse call.
-                const reuseActivate = (action.active as boolean | undefined) === true
-                const updateProps: chrome.tabs.UpdateProperties = { url: targetUrl }
-                if (reuseActivate) updateProps.active = true
-                const updated = await chrome.tabs.update(candidate.id, updateProps)
-                await waitForTabLoad(candidate.id)
+                updated = await chrome.tabs.update(candidate.id, updateProps)
+              } catch {
+                // Tab vanished between query and update — fall through to create.
+              }
+              if (updated) {
+                // Only the vanished-tab case falls through. A load timeout is
+                // NOT a reuse failure — the tab is already navigating, and
+                // falling through here would navigate one tab AND create a
+                // second, leaving two candidates for the next command.
+                try { await waitForTabLoad(candidate.id) } catch {}
                 // Pin the reused tab as the auto-target for subsequent commands.
                 // Mirrors the new-tab path below: every successful tab_create
                 // — whether new or reused — must update activeTabId so a fresh
@@ -47,10 +56,8 @@ export async function handleTabActions(
                 await chrome.storage.session.set({ activeTabId: candidate.id })
                 return {
                   success: true,
-                  data: { tabId: candidate.id, url: updated?.url ?? targetUrl, groupId, reused: true }
+                  data: { tabId: candidate.id, url: updated.url ?? targetUrl, groupId, reused: true }
                 }
-              } catch {
-                // Tab vanished between query and update — fall through to create.
               }
             }
           }
@@ -93,16 +100,33 @@ export async function handleTabActions(
       if (groupId === -1) return { success: true, data: { closed: [], count: 0 } }
       const groupTabs = await chrome.tabs.query({ groupId })
       const ids = groupTabs.map(t => t.id).filter((id): id is number => typeof id === "number")
-      if (ids.length > 0) await chrome.tabs.remove(ids)
+      // Remove per-id: a batched remove([ids]) rejects wholesale if any one
+      // tab vanished between query and remove, stranding the rest open.
+      const closed: number[] = []
+      for (const id of ids) {
+        try {
+          await chrome.tabs.remove(id)
+          closed.push(id)
+        } catch {
+          // Already gone (user or race) — the desired end state.
+        }
+      }
       const stored = await chrome.storage.session.get("activeTabId") as { activeTabId?: number }
       if (stored.activeTabId !== undefined && ids.includes(stored.activeTabId)) {
         await chrome.storage.session.remove("activeTabId")
       }
-      return { success: true, data: { closed: ids, count: ids.length } }
+      return { success: true, data: { closed, count: closed.length } }
     }
 
     case "tab_switch": {
-      await chrome.tabs.update(action.tabId as number, { active: true })
+      const target = await chrome.tabs.update(action.tabId as number, { active: true })
+      // active:true selects the tab within its own window but does not focus
+      // that window — in a multi-window session the "explicit focus move"
+      // must also bring the window forward or screenshots capture whatever
+      // window Chrome is actually showing.
+      if (target?.windowId !== undefined) {
+        await chrome.windows.update(target.windowId, { focused: true })
+      }
       await chrome.storage.session.set({ activeTabId: action.tabId as number })
       return { success: true }
     }

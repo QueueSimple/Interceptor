@@ -9,9 +9,25 @@ export async function ensureInterceptorGroup(): Promise<number> {
       interceptorGroupId = null
     }
   }
-  const groups = await chrome.tabGroups.query({ title: "interceptor" })
+  // Module state dies on every MV3 service-worker restart; session storage
+  // survives those (cleared only on browser/extension restart), so prefer the
+  // id we recorded at creation over re-discovery.
+  const stored = await chrome.storage.session.get("interceptorGroupId") as { interceptorGroupId?: number }
+  if (typeof stored.interceptorGroupId === "number") {
+    try {
+      await chrome.tabGroups.get(stored.interceptorGroupId)
+      interceptorGroupId = stored.interceptorGroupId
+      return interceptorGroupId
+    } catch {
+      await chrome.storage.session.remove("interceptorGroupId")
+    }
+  }
+  // Recovery by title alone would adopt any user-created group named
+  // "interceptor"; requiring our color too narrows it to groups we created.
+  const groups = await chrome.tabGroups.query({ title: "interceptor", color: "cyan" })
   if (groups.length > 0) {
     interceptorGroupId = groups[0].id
+    await chrome.storage.session.set({ interceptorGroupId })
     return interceptorGroupId
   }
   return -1
@@ -23,6 +39,7 @@ export async function addTabToInterceptorGroup(tabId: number): Promise<number> {
     groupId = await chrome.tabs.group({ tabIds: tabId })
     await chrome.tabGroups.update(groupId, { title: "interceptor", color: "cyan" })
     interceptorGroupId = groupId
+    await chrome.storage.session.set({ interceptorGroupId: groupId })
   } else {
     await chrome.tabs.group({ tabIds: tabId, groupId })
   }
