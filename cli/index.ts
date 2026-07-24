@@ -272,6 +272,14 @@ async function main() {
     }
   }
 
+  // Screenshot save routing: pop CLI-local fields before the action goes to the extension
+  let ssLabel: string | undefined
+  let ssOut: string | undefined
+  if (action?.type === "screenshot") {
+    if (typeof action.label === "string") { ssLabel = action.label; delete action.label }
+    if (typeof action.out === "string") { ssOut = action.out; delete action.out }
+  }
+
   // Apply global modifiers
   if (anyTab) action.anyTab = true
   if (filtered.includes("--changes")) action.changes = true
@@ -319,10 +327,26 @@ async function main() {
       const base64 = dataUrl.split(",")[1]
       const formatStr = d.format as string
       const ext = formatStr === "png" ? "png" : formatStr === "webp" ? "webp" : "jpg"
-      const filename = `interceptor-screenshot-${Date.now()}.${ext}`
       const bytes = Buffer.from(base64, "base64")
-      await Bun.write(filename, bytes)
-      d.filePath = `${process.cwd()}/${filename}`
+      let outPath: string
+      if (ssOut) {
+        // --out: explicit destination, exact path, no scheme
+        outPath = ssOut.startsWith("/") ? ssOut : `${process.cwd()}/${ssOut}`
+      } else {
+        // Designated home: $INTERCEPTOR_SCREENSHOT_DIR (default PAI memory zone), date subdirs.
+        const home = process.env.HOME || "~"
+        const baseDir = process.env.INTERCEPTOR_SCREENSHOT_DIR || `${home}/.claude/PAI/MEMORY/SCREENSHOTS`
+        const now = new Date()
+        const pad = (n: number) => String(n).padStart(2, "0")
+        const day = `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}`
+        const time = `${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}`
+        const label = ssLabel ? `-${ssLabel.toLowerCase().replace(/[^a-z0-9._-]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 60)}` : ""
+        outPath = `${baseDir}/${day}/${time}${label}.${ext}`
+        // collision guard for same-second saves
+        if (await Bun.file(outPath).exists()) outPath = `${baseDir}/${day}/${time}${label}-${Date.now() % 1000}.${ext}`
+      }
+      await Bun.write(outPath, bytes) // Bun.write creates parent dirs
+      d.filePath = outPath
       delete d.save
       delete d.dataUrl
       process.stderr.write(`saved: ${d.filePath}\n`)
