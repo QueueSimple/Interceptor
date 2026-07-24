@@ -186,11 +186,26 @@ async function ensureInterceptorGroup() {
       interceptorGroupId = null;
     }
   }
+  const area = sessionArea2();
+  if (area) {
+    const stored = await area.get("interceptorGroupId");
+    if (typeof stored.interceptorGroupId === "number") {
+      try {
+        await chrome.tabGroups.get(stored.interceptorGroupId);
+        interceptorGroupId = stored.interceptorGroupId;
+        return interceptorGroupId;
+      } catch {
+        await area.remove("interceptorGroupId");
+      }
+    }
+  }
   const candidates = await getCandidateTitles();
   const groups = await chrome.tabGroups.query({});
   const match = groups.find((g) => typeof g.title === "string" && candidates.includes(g.title));
   if (match) {
     interceptorGroupId = match.id;
+    if (area)
+      await area.set({ interceptorGroupId });
     return interceptorGroupId;
   }
   return -1;
@@ -220,6 +235,9 @@ async function addTabToInterceptorGroupSerialized(tabId) {
       color: getTabGroupColor()
     });
     interceptorGroupId = groupId;
+    const created = sessionArea2();
+    if (created)
+      await created.set({ interceptorGroupId: groupId });
   } else {
     await chrome.tabs.group({ tabIds: tabId, groupId });
   }
@@ -1768,19 +1786,24 @@ async function handleTabActions(action, tabId) {
             const sorted = groupTabs.filter((t) => typeof t.id === "number").sort((a, b) => b.id - a.id);
             const candidate = sorted[0];
             if (candidate?.id !== undefined) {
+              const reuseActivate = action.active === true;
+              const updateProps = { url: targetUrl };
+              if (reuseActivate)
+                updateProps.active = true;
+              let updated;
               try {
-                const reuseActivate = action.active === true;
-                const updateProps = { url: targetUrl };
-                if (reuseActivate)
-                  updateProps.active = true;
-                const updated = await chrome.tabs.update(candidate.id, updateProps);
-                await waitForTabLoad(candidate.id);
+                updated = await chrome.tabs.update(candidate.id, updateProps);
+              } catch {}
+              if (updated) {
+                try {
+                  await waitForTabLoad(candidate.id);
+                } catch {}
                 await sessionArea3().set({ [activeTabKey(group)]: candidate.id });
                 return {
                   success: true,
-                  data: { tabId: candidate.id, url: updated?.url ?? targetUrl, groupId, group, reused: true }
+                  data: { tabId: candidate.id, url: updated.url ?? targetUrl, groupId, group, reused: true }
                 };
-              } catch {}
+              }
             }
           }
         }
@@ -1805,8 +1828,30 @@ async function handleTabActions(action, tabId) {
       }
       return { success: true };
     }
+    case "tab_sweep": {
+      const groupId = await ensureInterceptorGroup();
+      if (groupId === -1)
+        return { success: true, data: { closed: [], count: 0 } };
+      const groupTabs = await chrome.tabs.query({ groupId });
+      const ids = groupTabs.map((t) => t.id).filter((id) => typeof id === "number");
+      const closed = [];
+      for (const id of ids) {
+        try {
+          await chrome.tabs.remove(id);
+          closed.push(id);
+        } catch {}
+      }
+      const stored = await sessionArea3().get("activeTabId");
+      if (stored.activeTabId !== undefined && ids.includes(stored.activeTabId)) {
+        await sessionArea3().remove("activeTabId");
+      }
+      return { success: true, data: { closed, count: closed.length } };
+    }
     case "tab_switch": {
-      await chrome.tabs.update(action.tabId, { active: true });
+      const target = await chrome.tabs.update(action.tabId, { active: true });
+      if (target?.windowId !== undefined) {
+        await chrome.windows.update(target.windowId, { focused: true });
+      }
       return { success: true };
     }
     case "tab_list": {
@@ -4198,6 +4243,7 @@ var TAB_ACTIONS = new Set([
   "tab_create",
   "tab_close",
   "tab_switch",
+  "tab_sweep",
   "tab_list",
   "tab_duplicate",
   "tab_reload",
@@ -4423,6 +4469,7 @@ var NO_TAB_ACTIONS = new Set([
   "brand_set_tab_group",
   "group_list",
   "group_close",
+  "tab_sweep",
   "keepawake",
   "idle_state"
 ]);
@@ -4549,14 +4596,35 @@ async function handleDaemonMessage(msg) {
   }
   if (tabId && needsTab(action.type) && !action.anyTab) {
     if (groupLabel) {
-      const inNamed = await isTabInNamedGroup(tabId, groupLabel);
+      let inNamed = false;
+      let exists = true;
+      try {
+        inNamed = await isTabInNamedGroup(tabId, groupLabel);
+      } catch {
+        exists = false;
+      }
+      if (!exists) {
+        fail(`tab ${tabId} does not exist`);
+        return;
+      }
       if (!inNamed) {
         fail(`tab ${tabId} is not in group '${groupLabel}' — pass the owning group, or --any-tab to bypass`);
         return;
       }
     } else {
-      const inAny = await isTabInAnyManagedGroup(tabId);
-      if (!inAny && anyManagedGroupKnown()) {
+      let inAny = false;
+      let exists = true;
+      try {
+        inAny = await isTabInAnyManagedGroup(tabId);
+      } catch {
+        exists = false;
+      }
+      if (!exists) {
+        fail(`tab ${tabId} does not exist`);
+        return;
+      }
+      const destructive = action.type === "tab_close";
+      if (!inAny && (anyManagedGroupKnown() || destructive)) {
         fail(`tab ${tabId} is not in the interceptor group — use 'interceptor tab new' to create managed tabs`);
         return;
       }
