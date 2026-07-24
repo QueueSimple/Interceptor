@@ -27,7 +27,7 @@ export function drainMessageQueue(): void {
 
 export function needsTab(type: string): boolean {
   const noTabActions = new Set([
-    "status", "reload_extension", "tab_create", "tab_list", "window_create", "window_list", "window_get_all",
+    "status", "reload_extension", "tab_create", "tab_list", "tab_sweep", "window_create", "window_list", "window_get_all",
     "history_search", "history_delete_all", "bookmark_tree", "bookmark_search",
     "bookmark_create", "downloads_search", "browsing_data_remove",
     "session_list", "session_restore", "notification_create", "notification_clear",
@@ -88,6 +88,11 @@ export async function handleDaemonMessage(msg: {
   const action = msg.action
   let tabId = msg.tabId
 
+  // Actions that name their own target (tab_close <id>, tab_switch <id>)
+  // resolve to that target — never to the ambient focused tab, which may be
+  // the user's own unmanaged tab and would fail the group guard below.
+  if (!tabId && typeof action.tabId === "number") tabId = action.tabId
+
   if (!tabId && needsTab(action.type)) {
     const stored = await chrome.storage.session.get("activeTabId") as { activeTabId?: number }
     tabId = stored.activeTabId
@@ -109,7 +114,22 @@ export async function handleDaemonMessage(msg: {
   if (tabId) chrome.storage.session.set({ activeTabId: tabId })
 
   if (tabId && needsTab(action.type) && !action.anyTab) {
-    const inGroup = await isTabInInterceptorGroup(tabId)
+    // Guard the tab the action will actually operate on: an explicit
+    // action.tabId (tab_close/tab_switch target) wins over the ambient
+    // resolved tab, so closing a managed tab never fails just because the
+    // user's own tab happens to be focused.
+    const guardTarget = typeof action.tabId === "number" ? action.tabId : tabId
+    let inGroup: boolean
+    try {
+      inGroup = await isTabInInterceptorGroup(guardTarget)
+    } catch {
+      // chrome.tabs.get throws on a stale/nonexistent id — answer cleanly
+      // instead of letting the request die into the extension timeout.
+      clearTimeout(requestTimer)
+      pendingRequests.delete(msg.id)
+      sendToHost({ id: msg.id, result: { success: false, error: `tab ${guardTarget} does not exist` } }, respondViaWs)
+      return
+    }
     if (!inGroup && interceptorGroupId !== null) {
       clearTimeout(requestTimer)
       pendingRequests.delete(msg.id)
@@ -117,7 +137,7 @@ export async function handleDaemonMessage(msg: {
         id: msg.id,
         result: {
           success: false,
-          error: `tab ${tabId} is not in the interceptor group — use 'interceptor tab new' to create managed tabs`
+          error: `tab ${guardTarget} is not in the interceptor group — use 'interceptor tab new' to create managed tabs`
         }
       }, respondViaWs)
       return

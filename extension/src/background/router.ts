@@ -43,7 +43,7 @@ const CANVAS_ACTIONS = new Set([
   "canvas_ocr"
 ])
 const TAB_ACTIONS = new Set([
-  "tab_create", "tab_close", "tab_switch", "tab_list", "tab_duplicate",
+  "tab_create", "tab_close", "tab_switch", "tab_sweep", "tab_list", "tab_duplicate",
   "tab_reload", "tab_mute", "tab_pin", "tab_zoom_get", "tab_zoom_set",
   "tab_group", "tab_ungroup", "tab_move", "tab_discard"
 ])

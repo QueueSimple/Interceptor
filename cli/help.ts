@@ -103,6 +103,7 @@ Tabs:
   interceptor tab new [url] --activate       Open new tab and foreground it (explicit opt-in)
   interceptor tab close [id]                 Close tab
   interceptor tab switch <id>                Switch to tab (explicit focus move)
+  interceptor tab sweep                      Close ALL Interceptor-managed tabs (user tabs untouched)
 
 Capture:
   interceptor screenshot                     Full-page DOM-render screenshot (default — works without focus)

@@ -85,6 +85,22 @@ export async function handleTabActions(
       return { success: true }
     }
 
+    case "tab_sweep": {
+      // Close every tab in the Interceptor group in one call. User tabs are
+      // spared by definition — they are never in the group. No-op (success,
+      // count 0) when the group doesn't exist.
+      const groupId = await ensureInterceptorGroup()
+      if (groupId === -1) return { success: true, data: { closed: [], count: 0 } }
+      const groupTabs = await chrome.tabs.query({ groupId })
+      const ids = groupTabs.map(t => t.id).filter((id): id is number => typeof id === "number")
+      if (ids.length > 0) await chrome.tabs.remove(ids)
+      const stored = await chrome.storage.session.get("activeTabId") as { activeTabId?: number }
+      if (stored.activeTabId !== undefined && ids.includes(stored.activeTabId)) {
+        await chrome.storage.session.remove("activeTabId")
+      }
+      return { success: true, data: { closed: ids, count: ids.length } }
+    }
+
     case "tab_switch": {
       await chrome.tabs.update(action.tabId as number, { active: true })
       await chrome.storage.session.set({ activeTabId: action.tabId as number })

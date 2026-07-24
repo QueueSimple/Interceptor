@@ -24,14 +24,23 @@ export async function parseTabsCommand(filtered: string[]): Promise<Action | nul
           if (filtered.includes("--activate")) action.active = true
           return action
         }
-        case "close":
-          return filtered[2]
-            ? { type: "tab_close", tabId: parseInt(filtered[2]) }
+        case "close": {
+          const idArg = filtered[2] && !filtered[2].startsWith("--") ? filtered[2] : undefined
+          const action: Action = idArg
+            ? { type: "tab_close", tabId: parseInt(idArg) }
             : { type: "tab_close" }
+          // Explicit opt-in to close a tab OUTSIDE the interceptor group
+          // (e.g. pre-existing junk tabs). Auditable escape hatch — replaces
+          // the old seat-an-about:blank loophole.
+          if (filtered.includes("--any")) action.anyTab = true
+          return action
+        }
         case "switch":
           return { type: "tab_switch", tabId: parseInt(filtered[2]) }
+        case "sweep":
+          return { type: "tab_sweep" }
         default:
-          console.error("error: unknown tab subcommand. Use: new, close, switch")
+          console.error("error: unknown tab subcommand. Use: new, close, switch, sweep")
           process.exit(1)
       }
       break
