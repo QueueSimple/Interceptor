@@ -508,7 +508,7 @@ async function main() {
       } else {
         // Designated home: $INTERCEPTOR_SCREENSHOT_DIR (default PAI memory zone), date subdirs.
         const home = process.env.HOME || "~"
-        const baseDir = process.env.INTERCEPTOR_SCREENSHOT_DIR || `${home}/.claude/PAI/MEMORY/SCREENSHOTS`
+        const baseDir = process.env.INTERCEPTOR_SCREENSHOT_DIR || `${home}/.claude/LIFEOS/MEMORY/SCREENSHOTS`
         const now = new Date()
         const pad = (n: number) => String(n).padStart(2, "0")
         const day = `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}`

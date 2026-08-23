@@ -3,7 +3,7 @@
  * screenshot-gc.ts — retention for the Interceptor screenshot home.
  *
  * Layout it manages:
- *   $INTERCEPTOR_SCREENSHOT_DIR/            (default ~/.claude/PAI/MEMORY/SCREENSHOTS)
+ *   $INTERCEPTOR_SCREENSHOT_DIR/            (default ~/.claude/LIFEOS/MEMORY/SCREENSHOTS)
  *     YYYY-MM-DD/ ...images...              live day dirs (written by `interceptor screenshot --save`)
  *     _archive/YYYY-MM-DD.tar.gz            archived day dirs
  *
@@ -19,7 +19,7 @@ import { readdirSync, statSync, existsSync, rmSync, mkdirSync } from "node:fs"
 import { join } from "node:path"
 
 const HOME = process.env.HOME || "/root"
-const BASE = process.env.INTERCEPTOR_SCREENSHOT_DIR || join(HOME, ".claude/PAI/MEMORY/SCREENSHOTS")
+const BASE = process.env.INTERCEPTOR_SCREENSHOT_DIR || join(HOME, ".claude/LIFEOS/MEMORY/SCREENSHOTS")
 const ARCHIVE_DIR = join(BASE, "_archive")
 
 const args = process.argv.slice(2)
