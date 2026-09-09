@@ -4801,6 +4801,7 @@ var TAB_ACTIONS = new Set([
   "tab_create",
   "tab_close",
   "tab_switch",
+  "tab_sweep",
   "tab_list",
   "tab_duplicate",
   "tab_reload",
