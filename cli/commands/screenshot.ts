@@ -40,8 +40,6 @@ export function parseScreenshotCommand(filtered: string[]): Action {
       }
       if (filtered.includes("--element")) ssAction.element = parseInt(filtered[filtered.indexOf("--element") + 1])
       if (filtered.includes("--ref")) ssAction.ref = filtered[filtered.indexOf("--ref") + 1]
-      if (filtered.includes("--label")) ssAction.label = filtered[filtered.indexOf("--label") + 1]
-      if (filtered.includes("--out")) ssAction.out = filtered[filtered.indexOf("--out") + 1]
       if (filtered.includes("--target-max-long-edge")) {
         const raw = filtered[filtered.indexOf("--target-max-long-edge") + 1]
         const parsed = parseInt(raw)
