@@ -15,7 +15,7 @@ phone is set up. Phones auto-connect on the first drive verb.
 | `interceptor ios install [<device>]` | Push / refresh the prebuilt agent (operator path). |
 | `interceptor ios devices` | Phones with the agent installed, plus aliases, transport (USB/network), and iOS version. |
 | `interceptor ios discover` | Full device discovery with toolchain + readiness notes. |
-| `interceptor ios status` | Per-phone connection state: `connected` while driving, `disconnected` when installed but idle. |
+| `interceptor ios status` | Per-phone connection state: `connected` while the runner is dialed in, `disconnected` when it is not (next drive verb auto-connects). |
 | `interceptor ios name <device> <alias>` | Alias a phone so you can use `--on <alias>` (e.g. `--on phone`). |
 
 ## Drive verbs
@@ -28,6 +28,8 @@ phone is set up. Phones auto-connect on the first drive verb.
 | `interceptor ios click <ref> \| --x N --y N` | Deterministic coordinate tap at the ref's frame center (or raw coordinates). |
 | `interceptor ios type <ref> "text"` | Focus the field at `<ref>`, then type. Most reliable text entry — focus is atomic. |
 | `interceptor ios keys "text"` | Type into whatever is already focused (append). |
+| `interceptor ios type <ref> --secret <name>` / `ios keys --secret <name>` | Type a vault secret (passcode) by name; the daemon resolves it and the runner falls back to SpringBoard when a system passcode sheet owns the keyboard. Register once: `interceptor macos secret register ios-passcode --target ios`. |
+| `interceptor ios unlock --secret <name>` / `ios unlock --probe` | Lock screen: wake, swipe up, type the passcode into SpringBoard's passcode field, wait for unlock. Needs the runner resident (it cannot start on a locked phone). `--probe` reports lock state + whether the passcode field appeared, without typing. |
 | `interceptor ios scroll [<ref>] --dir up\|down\|left\|right` | Scroll the view (or the element at `<ref>`). |
 | `interceptor ios drag <from> <to> [--duration s]` | Drag between two element refs (frame center to frame center). |
 | `interceptor ios press home\|lock\|volume-up\|volume-down` | Hardware button. `lock` locks the phone (avoid mid-flow — it blocks launches). |
@@ -75,8 +77,15 @@ they work even when the runner is idle or asleep. Routed before the runner fallb
 - **Refs are coordinates, not handles.** They are re-minted on every `tree` read, so
   they never go stale the way server-side element ids do — but they only reflect the
   screen at read time. Re-read after any navigation.
-- **Unlocked + foreground.** A locked phone refuses app launches. The runner drops on
-  idle and re-dials per verb, so chain a `launch` and its follow-up verbs closely.
-- **UI only.** Cannot pass Face ID / passcode / Apple Pay or unlock the phone.
+- **Unlocked + foreground.** A locked phone refuses app launches. Keep Auto-Lock off so
+  the runner stays resident; while connected, `ios unlock --secret <name>` attempts
+  passcode entry and requires an observed unlocked state for success. Disconnected unlock
+  and `--probe` fail immediately. Unlock once and run `ios tree` to connect first.
+- **Passcodes come from the vault.** Nothing can fake Face ID or Apple Pay. A passcode sheet
+  is typed with `ios type <ref> --secret <name>` / `ios keys --secret <name>`; never put a
+  passcode in a literal `type` call. Register it once with
+  `interceptor macos secret register <name> --target ios`.
 - **After a device reboot.** The phone drops off usbmux (its Wi‑Fi route is cleared even though `xcrun devicectl list devices` still lists it) → a brief USB cable touch reseeds it. The first runner launch also pops an on-device *"Enter iPhone Passcode for XCTest — Enable UI Automation"* dialog; approve it, then a daemon restart clears the stale testmanagerd session. Runner-free lanes (`proc`/`shot`) keep working through all of this.
+- **Runner never registers (`did not register within 120s`).** The error names the address the runner was handed and the rung that chose it (`ios status` → `dialBack` / `dialBackVia`). A local-network address (rungs `interface`, `subnet`, `default-route`, `first`) is silently denied while the runner's Local Network privilege is still undetermined: XCTest backgrounds the runner before it dials, and iOS denies a backgrounded app's local-network connection without showing the alert (TN3179). Once Settings › Privacy & Security › Local Network shows InterceptorRunner-Runner switched on, LAN dial-back registers in about 10 s. Fixes: grant that switch, or put the phone and Mac on the same VPN (Tailscale), which the daemon prefers automatically (`dialBackVia: vpn`). `INTERCEPTOR_WS_URL` overrides the ladder.
+- **Away from home (phone on cellular + VPN only).** Not driveable: iOS does not expose lockdown (62078) or RemotePairing (49152) on the VPN interface (`Connection refused`), so usbmuxd cannot see the phone and no runner can be launched. A computer next to the phone (USB or its Wi-Fi) must run the daemon. Runner-free lanes are equally blocked.
 - Add `--json` to any command for machine-readable output.

@@ -8,7 +8,7 @@ import { pruneStaleRefs } from "./content/ref-registry"
 import { buildA11yTree } from "./content/a11y-tree"
 import { getPageState } from "./content/state"
 import { dispatchClickSequence, dispatchKeySequence, resolveElement, waitForDomStable } from "./content/input-simulation"
-import { handleClick, handleDblclick, handleRightclick, handleClickAt, handleWhatAt } from "./content/actions/click"
+import { handleClick, handleClickSelector, handleDblclick, handleRightclick, handleClickAt, handleWhatAt } from "./content/actions/click"
 import { handleInputText, handleSelectOption, handleCheck } from "./content/actions/type"
 import { handleScroll, handleScrollAbsolute, handleScrollTo, handleGetPageDimensions } from "./content/actions/scroll"
 import { handleWait, handleWaitFor, handleWaitStable } from "./content/actions/wait"
@@ -66,9 +66,10 @@ async function handleAction(action: Action): Promise<ActionResult> {
   const wantChanges = !!(action.changes)
   if (wantChanges) cacheSnapshot()
   const result = await executeAction(action)
-  const sw = getStaleWarning()
-  if (sw && result.success) result.warning = sw
-  else if (warnDirty && result.success) result.warning = "DOM has changed since last state read"
+  // Append the page-state note; never replace the action's own warning (a
+  // replaced "no DOM change" hid every missed click after the first, 2026-09-07).
+  const note = getStaleWarning() ?? (warnDirty ? "DOM has changed since last state read" : null)
+  if (note && result.success) result.warning = result.warning ? `${result.warning}; ${note}` : note
   if (wantChanges && result.success) {
     const diffResult = computeSnapshotDiff()
     if (diffResult.success) (result as Record<string, unknown>).changes = diffResult.data
@@ -81,6 +82,7 @@ async function executeAction(action: Action): Promise<ActionResult> {
     switch (action.type) {
       case "get_state":           return getPageState(action.full as boolean)
       case "click":               return handleClick(action)
+      case "click_selector":      return handleClickSelector(action)
       case "dblclick":            return handleDblclick(action)
       case "rightclick":          return handleRightclick(action)
       case "drag":                return handleDrag(action)

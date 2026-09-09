@@ -6,13 +6,14 @@
  * combines the results into a single output.
  */
 
-import { sendCommand, sendCommandWs, type DaemonResponse } from "../transport"
+import { ActionValidationError, sendCommand, sendCommandWs, type DaemonResponse } from "../transport"
 import { parseElementTarget } from "../parse"
 import { hasTrustedFlag } from "./flags"
+import { normalizeArgsSplit } from "../normalize"
 import { maybeEmitResearchHint } from "./research"
 
 type Action = { type: string; [key: string]: unknown }
-type Result = { success: boolean; error?: string; data?: unknown; tabId?: number }
+type Result = { success: boolean; error?: string; data?: unknown; tabId?: number; deliveryAttempted?: boolean }
 type ReadAggregate = {
   success: boolean
   tree?: string
@@ -47,7 +48,7 @@ async function send(action: Action, tabId?: number, useWs = false, contextId?: s
       : await sendCommand(action, tabId, contextId)
     return unwrap(resp)
   } catch (err) {
-    return { success: false, error: (err as Error).message }
+    return { success: false, error: (err as Error).message, deliveryAttempted: !(err instanceof ActionValidationError) }
   }
 }
 
@@ -123,12 +124,33 @@ export function buildReadTreeAction(opts: {
 
 // ── interceptor open <url> ──────────────────────────────────────────────────────────
 
+export type TabCreateAction = {
+  type: "tab_create"
+  url: string
+  reuse?: boolean
+  reusePolicy?: boolean
+  active?: boolean
+  prepareOnly?: boolean
+}
+
 export function buildTabCreateAction(
   filtered: string[],
-  url: string
-): { type: "tab_create"; url: string; reuse?: boolean; active?: boolean } {
-  const action: { type: "tab_create"; url: string; reuse?: boolean; active?: boolean } = { type: "tab_create", url }
+  url: string,
+  opts?: { policyDefault?: boolean }
+): TabCreateAction {
+  const action: TabCreateAction = { type: "tab_create", url }
+  if (filtered.includes("--reuse") && filtered.includes("--no-reuse")) {
+    console.error("error: --reuse conflicts with --no-reuse")
+    process.exit(1)
+  }
+  // --reuse / --no-reuse are the explicit per-call decisions. Without either,
+  // `open` (policyDefault) marks the action reuse-undecided via `reusePolicy`
+  // and the extension's resolved tabLifecycle policy decides — named groups
+  // only. `tab new` never sets policyDefault: it is the ⌘T verb and
+  // always creates unless --reuse is passed.
   if (filtered.includes("--reuse")) action.reuse = true
+  else if (filtered.includes("--no-reuse")) action.reuse = false
+  else if (opts?.policyDefault) action.reusePolicy = true
   // --activate is the explicit opt-in for foregrounding the new tab.
   // Default is background-first; the extension's tab_create handler reads
   // `action.active === true` and only then passes `active: true` to
@@ -158,8 +180,9 @@ export async function runOpen(
   const timeoutIdx = filtered.indexOf("--timeout")
   const timeout = timeoutIdx !== -1 ? parseInt(filtered[timeoutIdx + 1]) : 5000
 
-  // Step 1: Create tab (or reuse an existing managed one when --reuse is set)
-  const createAction = buildTabCreateAction(filtered, url)
+  // Step 1: Create tab (or reuse an existing managed one when --reuse is set,
+  // or by policy default for named-group calls)
+  const createAction = buildTabCreateAction(filtered, url, { policyDefault: true })
   const createResult = await send(createAction, globalTabId, useWs, contextId)
   if (!createResult.success) {
     output(jsonMode, { success: false, error: createResult.error || "failed to create tab" })
@@ -252,6 +275,211 @@ export async function runOpen(
   // Layer C: one rate-limited, opt-out hint to stderr when an agent opens a
   // search engine and no research ledger is active. Information, not coercion —
   // it changes nothing about the command's behavior or output.
+  maybeEmitResearchHint(url, filtered)
+}
+
+// ── interceptor websearch <query> ───────────────────────────────────────────
+
+const WEBSEARCH_BOOLEAN_FLAGS = new Set([
+  "--tree-only", "--text-only", "--markdown", "--full", "--reuse",
+  "--no-reuse", "--activate", "--no-wait"
+])
+
+export const SEARCH_DEPRECATION_WARNING =
+  "warning: 'interceptor search' is deprecated; use 'interceptor websearch' for the web or 'interceptor find' for the current page."
+
+export function webSearchQuery(filtered: string[]): string {
+  const parts: string[] = []
+  for (let i = 1; i < filtered.length; i++) {
+    const token = filtered[i]
+    if (WEBSEARCH_BOOLEAN_FLAGS.has(token)) continue
+    if (token === "--timeout") { i++; continue }
+    if (token.startsWith("--")) continue
+    parts.push(token)
+  }
+  const query = parts.join(" ")
+  return query.trim() ? query : ""
+}
+
+function resultObject(result: Result): Record<string, unknown> {
+  return typeof result.data === "object" && result.data
+    ? result.data as Record<string, unknown>
+    : {}
+}
+
+async function closeNewBlankSearchTab(
+  tabId: number,
+  useWs: boolean,
+  contextId?: string
+): Promise<void> {
+  const tabsResult = await send({ type: "tab_list" }, undefined, useWs, contextId)
+  const tabs = Array.isArray(tabsResult.data) ? tabsResult.data as Array<Record<string, unknown>> : []
+  const target = tabs.find(tab => tab.id === tabId)
+  const url = typeof target?.url === "string" ? target.url : ""
+  if (shouldCloseFailedSearchTab(false, url)) {
+    await send({ type: "tab_close", tabId }, tabId, useWs, contextId)
+  }
+}
+
+export function shouldCloseFailedSearchTab(reused: boolean, url: string): boolean {
+  if (reused) return false
+  return url === "" || url === "about:blank" || url.startsWith("chrome://newtab")
+}
+
+export function webSearchTimeout(filtered: string[]): number | null {
+  const timeoutIdx = filtered.indexOf("--timeout")
+  if (timeoutIdx === -1) return 5000
+  const raw = filtered[timeoutIdx + 1]
+  if (!raw || !/^\d+$/.test(raw)) return null
+  const timeout = Number(raw)
+  return Number.isSafeInteger(timeout) ? timeout : null
+}
+
+export async function runWebsearch(
+  filtered: string[],
+  globalTabId?: number,
+  jsonMode = false,
+  useWs = false,
+  contextId?: string
+): Promise<void> {
+  const query = webSearchQuery(filtered)
+  if (!query) {
+    console.error('error: interceptor websearch requires a non-empty query. Usage: interceptor websearch "<query>"')
+    process.exit(1)
+  }
+  if (filtered[0] === "search") {
+    console.error(SEARCH_DEPRECATION_WARNING)
+  }
+
+  // Check the target browser context before allocating anything. Provider
+  // fallback would violate the configured-default-provider contract.
+  const capability = await send({ type: "search_capability" }, undefined, useWs, contextId)
+  const available = capability.success && resultObject(capability).available === true
+  if (!available) {
+    output(jsonMode, {
+      success: false,
+      error: capability.error || "websearch is unavailable in this browser context: chrome.search.query is not exposed; no fallback provider was used"
+    })
+    return
+  }
+
+  const createAction = buildTabCreateAction(filtered, "about:blank", { policyDefault: true })
+  createAction.prepareOnly = true
+  const createResult = await send(createAction, globalTabId, useWs, contextId)
+  if (!createResult.success) {
+    output(jsonMode, { success: false, error: createResult.error || "failed to allocate managed search tab" })
+    return
+  }
+  const createData = resultObject(createResult)
+  const tabId = (createData.tabId as number) || createResult.tabId || globalTabId
+  if (!tabId) {
+    output(jsonMode, { success: false, error: "managed search tab allocation returned no tab ID" })
+    return
+  }
+  const reused = createData.reused === true
+  const initialUrl = typeof createData.url === "string" ? createData.url : ""
+
+  const searchResult = await send({ type: "search_query", query }, tabId, useWs, contextId)
+  if (!searchResult.success) {
+    if (!reused) await closeNewBlankSearchTab(tabId, useWs, contextId)
+    output(jsonMode, { success: false, error: searchResult.error || "default-provider search failed" })
+    return
+  }
+
+  const common: Record<string, unknown> = {
+    tabId,
+    groupId: createData.groupId,
+    group: createData.group,
+    reused
+  }
+  if (createData.groupWarning) common.groupWarning = createData.groupWarning
+
+  if (filtered.includes("--no-wait")) {
+    output(jsonMode, {
+      success: true,
+      data: { ...common, query, message: reused ? "search dispatched in reused managed tab (no-wait)" : "search dispatched in managed tab (no-wait)" }
+    })
+    return
+  }
+
+  const treeOnly = filtered.includes("--tree-only")
+  const textOnly = filtered.includes("--text-only")
+  const markdown = filtered.includes("--markdown")
+  const full = filtered.includes("--full")
+  const timeout = webSearchTimeout(filtered)
+  if (timeout === null) {
+    console.error("error: --timeout must be a non-negative integer")
+    process.exit(1)
+  }
+  const deadline = Date.now() + timeout
+
+  // Observe a navigation away from the allocator state when possible. This
+  // avoids reading the prior document from a reused tab before the provider
+  // navigation commits, while allowing an identical repeated query to proceed.
+  const navigationDeadline = Math.min(deadline, Date.now() + 1500)
+  while (Date.now() < navigationDeadline) {
+    const state = await send({ type: "get_state" }, tabId, useWs, contextId)
+    const url = typeof resultObject(state).url === "string" ? resultObject(state).url as string : ""
+    if (state.success && url && url !== "about:blank" && url !== initialUrl) break
+    await Bun.sleep(100)
+  }
+
+  while (Date.now() < deadline) {
+    const stable = await send({ type: "wait_stable", ms: 200, timeout: Math.max(1, Math.min(3000, deadline - Date.now())) }, tabId, useWs, contextId)
+    if (stable.success) break
+    await Bun.sleep(250)
+  }
+
+  let treeResult: Result | undefined
+  let textResult: Result | undefined
+  if (!textOnly) {
+    treeResult = await send({ type: "get_a11y_tree", depth: 15, filter: "interactive", maxChars: 50000 }, tabId, useWs, contextId)
+  }
+  if (!treeOnly) {
+    textResult = await send({ type: markdown ? "extract_markdown" : "extract_text" }, tabId, useWs, contextId)
+  }
+  const aggregate = aggregateReadResults({
+    treeRequested: !textOnly,
+    textRequested: !treeOnly,
+    treeResult,
+    textResult,
+    full
+  })
+  if (!aggregate.success) {
+    output(jsonMode, { success: false, error: aggregate.error || "search completed but the provider page could not be read" })
+    return
+  }
+
+  const stateResult = await send({ type: "get_state" }, tabId, useWs, contextId)
+  const state = resultObject(stateResult)
+  const url = typeof state.url === "string" ? state.url : initialUrl
+  const title = typeof state.title === "string" ? state.title : ""
+  const data = {
+    ...common,
+    query,
+    url,
+    title,
+    tree: aggregate.tree,
+    text: aggregate.text
+  }
+
+  if (jsonMode) {
+    const result: { success: boolean; data: unknown; warning?: string } = { success: true, data }
+    const warnings = [...(aggregate.warnings || [])]
+    if (typeof createData.groupWarning === "string") warnings.unshift(createData.groupWarning)
+    if (warnings.length) result.warning = warnings.join("; ")
+    console.log(JSON.stringify(result, null, 2))
+  } else {
+    const warnings = [...(aggregate.warnings || [])]
+    if (typeof createData.groupWarning === "string") warnings.unshift(createData.groupWarning)
+    if (warnings.length) console.error(`warning: ${warnings.join("; ")}`)
+    const parts = [`Tab: ${tabId} | ${title || url}${reused ? " (reused)" : ""}`, url]
+    if (aggregate.tree) parts.push("", aggregate.tree)
+    if (aggregate.tree && aggregate.text) parts.push("", "---")
+    if (aggregate.text) parts.push(aggregate.text)
+    console.log(parts.join("\n"))
+  }
+
   maybeEmitResearchHint(url, filtered)
 }
 
@@ -368,42 +596,44 @@ export async function runAct(
   globalTabId?: number,
   jsonMode = false,
   useWs = false,
-  contextId?: string
+  contextId?: string,
+  positionalCount?: number
 ): Promise<void> {
+  const normalized = positionalCount === undefined ? normalizeArgsSplit(filtered) : { argv: filtered, positionalCount }
+  filtered = normalized.argv
+  const positionalEnd = normalized.positionalCount + 1
+  const flags = filtered.slice(positionalEnd)
   const ref = filtered[1]
   if (!ref) {
     console.error("error: interceptor act requires a ref. Usage: interceptor act <ref> [value]")
     process.exit(1)
   }
 
-  const useOs = hasTrustedFlag(filtered)
-  const append = filtered.includes("--append")
-  const noRead = filtered.includes("--no-read")
-  const keysIdx = filtered.indexOf("--keys")
-  const timeoutIdx = filtered.indexOf("--timeout")
-  const timeout = timeoutIdx !== -1 ? parseInt(filtered[timeoutIdx + 1]) : 2000
-
-  // Find value: everything after ref that isn't a flag
-  const flagSet = new Set(["--trusted", "--os", "--append", "--no-read", "--keys", "--timeout"])
-  const valueArgs: string[] = []
-  let skip = false
-  for (let i = 2; i < filtered.length; i++) {
-    if (skip) { skip = false; continue }
-    if (filtered[i] === "--timeout" || filtered[i] === "--keys") { skip = true; continue }
-    if (flagSet.has(filtered[i])) continue
-    valueArgs.push(filtered[i])
+  if (["click", "type", "keys"].includes(ref) && /^e\d+(?:_\d+)?$/.test(filtered[2] ?? "")) {
+    output(jsonMode, { success: false, error: `act takes the ref directly. Use interceptor act ${filtered[2]} [value]` })
+    return
   }
+  const useOs = hasTrustedFlag(flags)
+  const append = flags.includes("--append")
+  const noRead = flags.includes("--no-read")
+  const keysIdx = flags.indexOf("--keys")
+  if (keysIdx !== -1 && (flags[keysIdx + 1] === undefined || flags[keysIdx + 1].startsWith("--"))) {
+    output(jsonMode, { success: false, error: "act --keys requires a key chord, e.g. interceptor act e5 --keys Enter" })
+    return
+  }
+  const timeoutIdx = flags.indexOf("--timeout")
+  const timeout = timeoutIdx !== -1 ? parseInt(flags[timeoutIdx + 1]) : 2000
+  const valueArgs = filtered.slice(2, positionalEnd)
   const value = valueArgs.length > 0 ? valueArgs.join(" ") : undefined
 
   const target = parseElementTarget(ref)
 
   // Step 1: Perform the action (may throw if click navigates the page)
   let actionResult: Result
-  let actionNavigated = false
 
   try {
   if (keysIdx !== -1) {
-    const keys = filtered[keysIdx + 1]
+    const keys = flags[keysIdx + 1]
     if (useOs) {
       const keyParts = keys.split("+")
       const key = keyParts[keyParts.length - 1]
@@ -442,33 +672,16 @@ export async function runAct(
   }
 
   } catch (err) {
-    // Click succeeded but page navigated, breaking the response port
-    const msg = (err as Error).message || ""
-    if (msg.includes("back/forward cache") || msg.includes("message channel is closed") || msg.includes("timeout")) {
-      actionNavigated = true
-      actionResult = { success: true }
-    } else {
-      output(jsonMode, { success: false, error: msg })
+    if (err instanceof ActionValidationError) {
+      output(jsonMode, { success: false, error: err.message })
       return
     }
+    actionResult = { success: false, error: (err as Error).message }
   }
 
   if (!actionResult!.success) {
     const errMsg = actionResult!.error || "action failed"
-    if (errMsg.includes("back/forward cache") || errMsg.includes("message channel is closed")) {
-      actionNavigated = true
-    } else {
-      output(jsonMode, { success: false, error: errMsg })
-      return
-    }
-  }
-
-  if (actionNavigated) {
-    if (jsonMode) {
-      output(jsonMode, { success: true, data: { action: "ok", note: "page navigated — use interceptor read to see the new page" } })
-    } else {
-      console.log("ok (page navigated — use interceptor read to see the new page)")
-    }
+    output(jsonMode, { success: false, error: actionResult!.deliveryAttempted === false ? errMsg : `${errMsg}. Delivery is unverified; read the target before retrying.` })
     return
   }
 
@@ -489,13 +702,11 @@ export async function runAct(
       globalTabId, useWs, contextId
     )
     diffResult = await send({ type: "diff" }, globalTabId, useWs, contextId)
-  } catch {
-    // Page likely navigated — action succeeded but post-read failed
-    if (jsonMode) {
-      output(jsonMode, { success: true, data: { action: "ok", note: "page navigated, post-action read unavailable" } })
-    } else {
-      console.log("ok (page navigated — use interceptor read to see the new page)")
-    }
+  } catch (err) {
+    treeResult = { success: false, error: (err as Error).message }
+  }
+  if (!treeResult.success) {
+    output(jsonMode, { success: true, data: { action: "delivered", verified: false, note: `Post-action read unavailable: ${treeResult.error ?? "unknown error"}. Read the target to verify its state.` } })
     return
   }
 
@@ -599,6 +810,9 @@ export async function runInspect(
 function output(jsonMode: boolean, result: { success: boolean; error?: string; data?: unknown }): void {
   if (jsonMode) {
     console.log(JSON.stringify(result, null, 2))
+    // Issue #237: JSON callers get the envelope AND a non-zero exit on failure,
+    // matching the text branch below and the generic-action path in cli/index.ts.
+    if (!result.success) process.exitCode = 1
   } else if (!result.success) {
     console.error(`error: ${result.error}`)
     process.exit(1)
@@ -616,12 +830,14 @@ function output(jsonMode: boolean, result: { success: boolean; error?: string; d
 export async function runCompoundCommand(
   cmd: string,
   filtered: string[],
-  opts: { jsonMode?: boolean; useWs?: boolean; globalTabId?: number; anyTab?: boolean; contextId?: string }
+  opts: { jsonMode?: boolean; useWs?: boolean; globalTabId?: number; anyTab?: boolean; contextId?: string; positionalCount?: number }
 ): Promise<void> {
   switch (cmd) {
     case "open":    return runOpen(filtered, opts.globalTabId, opts.jsonMode, opts.useWs, opts.contextId)
+    case "websearch":
+    case "search":  return runWebsearch(filtered, opts.globalTabId, opts.jsonMode, opts.useWs, opts.contextId)
     case "read":    return runRead(filtered, opts.globalTabId, opts.jsonMode, opts.useWs, opts.contextId)
-    case "act":     return runAct(filtered, opts.globalTabId, opts.jsonMode, opts.useWs, opts.contextId)
+    case "act":     return runAct(filtered, opts.globalTabId, opts.jsonMode, opts.useWs, opts.contextId, opts.positionalCount)
     case "inspect":  return runInspect(filtered, opts.globalTabId, opts.jsonMode, opts.useWs, opts.contextId)
     default:
       console.error(`error: unknown compound command '${cmd}'`)

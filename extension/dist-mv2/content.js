@@ -104,6 +104,9 @@ function getRelevantAttrs(el) {
     attrs.push("invalid");
   return attrs.join(" ");
 }
+function hasOwnPointerCursor(cursor, parentCursor) {
+  return cursor === "pointer" && parentCursor !== "pointer";
+}
 function getStyleBundle(el) {
   const cs = getComputedStyle(el);
   const parts = [];
@@ -159,7 +162,10 @@ function isUploadTarget(el, maxDepth = 3) {
   }
   return false;
 }
-function getEffectiveRole(el) {
+function shouldDescendDespiteZeroArea(display, position) {
+  return position === "fixed" || position === "absolute" || display === "inline";
+}
+function getEffectiveRole(el, style) {
   const explicit = el.getAttribute("role");
   if (explicit)
     return explicit;
@@ -214,7 +220,7 @@ function getEffectiveRole(el) {
   if (el.namespaceURI === "http://www.w3.org/2000/svg") {
     if (tag === "a")
       return "link";
-    if (el.hasAttribute("onclick") || getComputedStyle(el).cursor === "pointer")
+    if (el.hasAttribute("onclick") || (style ?? getComputedStyle(el)).cursor === "pointer")
       return "button";
     return "img";
   }
@@ -293,15 +299,14 @@ function buildA11yTree(root, depth, maxDepth, filter, includeStyle = false, form
     if (!selfVisible) {
       if (style.display === "none" || style.visibility === "hidden")
         return;
-      const pos = style.position;
-      if (pos !== "fixed" && pos !== "absolute")
+      if (!shouldDescendDespiteZeroArea(style.display, style.position))
         return;
     }
-    const role = getEffectiveRole(el);
+    const role = getEffectiveRole(el, style ?? undefined);
     const tag = el.tagName.toLowerCase();
     const isLandmark = LANDMARK_ROLES.has(role) || LANDMARK_TAGS.has(el.tagName);
     const isHeading = /^h[1-6]$/.test(tag) || role === "heading";
-    const isInteractiveEl = isInteractive(el, INTERACTIVE_TAGS, INTERACTIVE_ROLES);
+    const isInteractiveEl = isInteractive(el, INTERACTIVE_TAGS, INTERACTIVE_ROLES, style ?? undefined);
     const prefix = compact ? ">".repeat(d) : "  ".repeat(d);
     if (selfVisible && isLandmark && !isInteractiveEl) {
       const name = getAccessibleName(el);
@@ -402,7 +407,7 @@ function isVisible(el, style = getComputedStyle(el)) {
     return false;
   return true;
 }
-function isInteractive(el, tags, roles) {
+function isInteractive(el, tags, roles, style = getComputedStyle(el)) {
   if (tags.has(el.tagName))
     return true;
   const role = el.getAttribute("role");
@@ -422,8 +427,13 @@ function isInteractive(el, tags, roles) {
       return true;
     if (role && roles.has(role))
       return true;
-    const cursor = getComputedStyle(el).cursor;
-    if (cursor === "pointer")
+    if (style.cursor === "pointer")
+      return true;
+  }
+  if (style.cursor === "pointer" && el.tagName !== "BODY" && el.tagName !== "HTML") {
+    const parent = el.parentElement;
+    const parentCursor = parent ? getComputedStyle(parent).cursor : null;
+    if (hasOwnPointerCursor(style.cursor, parentCursor))
       return true;
   }
   return false;
@@ -434,7 +444,8 @@ function getInteractiveElements() {
   pruneStaleRefs();
   const results = [];
   walkWithShadow(document.body, (el) => {
-    if (isInteractive(el, INTERACTIVE_TAGS, INTERACTIVE_ROLES) && isVisible(el)) {
+    const style = getComputedStyle(el);
+    if (isInteractive(el, INTERACTIVE_TAGS, INTERACTIVE_ROLES, style) && isVisible(el, style)) {
       const idx = nextIndex++;
       const selector = buildSelector(el);
       selectorMap.set(idx, selector);
@@ -442,7 +453,7 @@ function getInteractiveElements() {
       const tag = el.tagName.toLowerCase();
       const text = getAccessibleName(el);
       const attrs = getRelevantAttrs(el);
-      refMetadata.set(refId, { role: getEffectiveRole(el), name: text, tag, value: (el.value || "").slice(0, 40) });
+      refMetadata.set(refId, { role: getEffectiveRole(el, style), name: text, tag, value: (el.value || "").slice(0, 40) });
       results.push({ index: idx, refId, element: el, selector, tag, text, attrs });
     }
   });
@@ -1142,6 +1153,16 @@ window.addEventListener("beforeunload", () => {
   domObserver.disconnect();
 });
 
+// extension/src/content/sensitive.ts
+var sensitiveElements = new WeakSet;
+function markSensitive(el) {
+  sensitiveElements.add(el);
+}
+function isSensitive(el) {
+  return sensitiveElements.has(el);
+}
+var SECURE_MASK = "***SECURE***";
+
 // extension/src/content/monitor.ts
 init_ref_registry();
 init_a11y_tree();
@@ -1219,6 +1240,8 @@ function describeTarget(target) {
   return out;
 }
 function isPasswordLike(el) {
+  if (isSensitive(el))
+    return true;
   if (!(el instanceof HTMLInputElement))
     return false;
   const type = (el.type || "").toLowerCase();
@@ -1233,6 +1256,8 @@ function isPasswordLike(el) {
   return false;
 }
 function maskedValue(el) {
+  if (isSensitive(el))
+    return SECURE_MASK;
   const len = (el.value || "").length;
   return `***${len}***`;
 }
@@ -1305,7 +1330,9 @@ function handleInput(e) {
       return;
     const info = describeTarget(target);
     let v = "";
-    if (target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement) {
+    if (isSensitive(target)) {
+      v = SECURE_MASK;
+    } else if (target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement) {
       if (target instanceof HTMLInputElement && isPasswordLike(target)) {
         v = maskedValue(target);
       } else {
@@ -1332,7 +1359,9 @@ function handleChange(e) {
       return;
     const info = describeTarget(target);
     let v = "";
-    if (target instanceof HTMLInputElement) {
+    if (isSensitive(target)) {
+      v = SECURE_MASK;
+    } else if (target instanceof HTMLInputElement) {
       if (isPasswordLike(target)) {
         v = maskedValue(target);
       } else if (target.type === "checkbox" || target.type === "radio") {
@@ -1785,13 +1814,43 @@ async function handleClick(action) {
   if (!el)
     return { success: false, error: `stale element [${action.index}] — run interceptor state to refresh` };
   scrollIntoViewIfNeeded(el);
+  const mutation = waitForMutation(200);
   dispatchClickSequence(el, action.x, action.y);
   const clickMsg = `clicked [${action.ref || action.index}]${action.x !== undefined ? ` at (${action.x},${action.y})` : ""}`;
-  const mutated = await waitForMutation(200);
+  const mutated = await mutation;
   if (!mutated) {
     return { success: true, data: clickMsg, warning: "no DOM change after click — if the site requires trusted events, try: interceptor click --trusted " + (action.ref || action.index) };
   }
   return { success: true, data: clickMsg };
+}
+async function handleClickSelector(action) {
+  const selector = String(action.selector ?? "");
+  if (!selector)
+    return { success: false, error: "click_selector: no selector given" };
+  let matches;
+  try {
+    matches = document.querySelectorAll(selector);
+  } catch {
+    return { success: false, error: `click_selector: invalid CSS selector ${JSON.stringify(selector)}` };
+  }
+  const nth = typeof action.nth === "number" ? action.nth : 0;
+  const el = matches[nth];
+  if (!el) {
+    return {
+      success: false,
+      error: `click_selector: ${selector} matched ${matches.length} element(s); no index ${nth}`
+    };
+  }
+  scrollIntoViewIfNeeded(el);
+  const mutation = waitForMutation(200);
+  dispatchClickSequence(el, action.x, action.y);
+  const clickedRef = getOrAssignRef(el);
+  const mutated = await mutation;
+  const msg = `clicked ${clickedRef} — ${selector}[${nth}] of ${matches.length}`;
+  if (!mutated) {
+    return { success: true, data: msg, refId: clickedRef, warning: `no DOM change after click — if the site requires trusted events, try: interceptor click --trusted ${clickedRef}` };
+  }
+  return { success: true, data: msg, refId: clickedRef };
 }
 async function handleDblclick(action) {
   const el = resolveElement(action.index, action.ref);
@@ -1863,6 +1922,8 @@ async function handleInputText(action) {
   const el = resolveElement(action.index, action.ref);
   if (!el)
     return { success: false, error: `stale element [${action.index}] — run interceptor state to refresh` };
+  if (action.sensitive === true)
+    markSensitive(el);
   el.focus();
   const text = action.text;
   const tag = el.tagName;
@@ -1897,7 +1958,7 @@ async function handleInputText(action) {
   if (shadowRoot) {
     const innerInput = shadowRoot.querySelector("input, textarea, [contenteditable='true']");
     if (innerInput) {
-      return handleInputText({ type: "input_text", ref: getOrAssignRef(innerInput), text, clear: action.clear });
+      return handleInputText({ type: "input_text", ref: getOrAssignRef(innerInput), text, clear: action.clear, sensitive: action.sensitive });
     }
   }
   const role = el.getAttribute("role");
@@ -2649,6 +2710,7 @@ async function handleExtractHtml(action) {
 
 // extension/src/content/data/query.ts
 init_input_simulation();
+init_ref_registry();
 async function handleQuery(action) {
   const selector = action.selector;
   const els = document.querySelectorAll(selector);
@@ -2658,6 +2720,7 @@ async function handleQuery(action) {
       count: els.length,
       elements: Array.from(els).slice(0, 20).map((el, i) => ({
         index: i,
+        ref: getOrAssignRef(el),
         tag: el.tagName.toLowerCase(),
         text: (el.textContent || "").trim().slice(0, 80),
         id: el.id || undefined,
@@ -2958,17 +3021,58 @@ init_ref_registry();
 init_element_discovery();
 init_a11y_tree();
 init_input_simulation();
-async function handleFindElement(action) {
-  const query = (action.query || "").toLowerCase();
-  const targetRole = (action.role || "").toLowerCase();
-  const limit = action.limit || 10;
+function findRenderedText(renderedText, rawQuery, limit = 10, contextChars = 80) {
+  const query = rawQuery.trim();
+  const boundedLimit = Number.isFinite(limit) ? Math.max(0, Math.floor(limit)) : 10;
+  const matches = [];
+  let total = 0;
+  if (query.length > 0) {
+    const haystack = renderedText.toLowerCase();
+    const needle = query.toLowerCase();
+    let from = 0;
+    while (from <= haystack.length - needle.length) {
+      const start = haystack.indexOf(needle, from);
+      if (start === -1)
+        break;
+      const end = start + query.length;
+      total++;
+      if (matches.length < boundedLimit) {
+        const snippetStart = Math.max(0, start - contextChars);
+        const snippetEnd = Math.min(renderedText.length, end + contextChars);
+        const prefix = snippetStart > 0 ? "…" : "";
+        const suffix = snippetEnd < renderedText.length ? "…" : "";
+        matches.push({
+          start,
+          end,
+          matchedText: renderedText.slice(start, end),
+          snippet: `${prefix}${renderedText.slice(snippetStart, snippetEnd).replace(/\s+/g, " ").trim()}${suffix}`
+        });
+      }
+      from = end;
+    }
+  }
+  return {
+    total,
+    returned: matches.length,
+    truncated: total > matches.length,
+    scannedCharacters: renderedText.length,
+    scanTruncated: false,
+    matches
+  };
+}
+function findAccessibleElements(rawQuery, rawRole, limit = 10) {
+  const query = rawQuery.trim().toLowerCase();
+  const targetRole = rawRole.trim().toLowerCase();
+  const boundedLimit = Number.isFinite(limit) ? Math.max(0, Math.floor(limit)) : 10;
   const results = [];
   for (const [refId, weakRef] of refRegistry) {
     const el = weakRef.deref();
     if (!el || !el.isConnected || !isVisible(el))
       continue;
-    const role = getEffectiveRole(el).toLowerCase();
-    const name = getAccessibleName(el).toLowerCase();
+    const effectiveRole = getEffectiveRole(el);
+    const accessibleName = getAccessibleName(el);
+    const role = effectiveRole.toLowerCase();
+    const name = accessibleName.toLowerCase();
     let score = 0;
     if (targetRole && role !== targetRole)
       continue;
@@ -2990,10 +3094,28 @@ async function handleFindElement(action) {
         score += 30;
     }
     if (score > 0)
-      results.push({ refId, role: getEffectiveRole(el), name: getAccessibleName(el), score });
+      results.push({ refId, role: effectiveRole, name: accessibleName, score });
   }
   results.sort((a, b) => b.score - a.score);
-  return { success: true, data: results.slice(0, limit) };
+  const matches = results.slice(0, boundedLimit);
+  return { total: results.length, returned: matches.length, truncated: results.length > matches.length, matches };
+}
+async function handleFindElement(action) {
+  const query = String(action.query || "").trim();
+  if (!query)
+    return { success: false, error: "find requires a non-empty query" };
+  const role = String(action.role || "");
+  const limit = typeof action.limit === "number" ? action.limit : 10;
+  const requestedMode = action.mode === "text" || action.mode === "elements" ? action.mode : "hybrid";
+  const mode = role ? "elements" : requestedMode;
+  const data = { query, mode };
+  if (mode !== "elements") {
+    data.text = findRenderedText(document.body?.innerText || "", query, limit);
+  }
+  if (mode !== "text") {
+    data.elements = findAccessibleElements(query, role, limit);
+  }
+  return { success: true, data };
 }
 async function handleSemanticResolve(action) {
   const match = findBestMatch(action.name, action.role);
@@ -3013,7 +3135,7 @@ async function handleFindAndType(action) {
   const match = findBestMatch(action.name, action.role, action.text);
   if (!match)
     return { success: false, error: "no matching element found (score < 30)" };
-  const typeResult = await handleInputText({ type: "input_text", ref: match.refId, text: action.inputText, clear: action.clear });
+  const typeResult = await handleInputText({ type: "input_text", ref: match.refId, text: action.inputText, clear: action.clear, sensitive: action.sensitive });
   return { success: true, data: { matched: { ref: match.refId, role: match.role, name: match.name, score: match.score }, actionResult: typeResult } };
 }
 async function handleFindAndCheck(action) {
@@ -4296,13 +4418,10 @@ async function handleCanvasAction(action) {
             data: { id, clicked: true, at: { x: cx, y: cy }, method: "synthetic" }
           };
         }
-        if (target.element)
-          clickElementCenter2(target.element);
-        else {
-          const { clickAtViewport: clickAtViewport3 } = await Promise.resolve().then(() => (init_ops(), exports_ops));
-          clickAtViewport3(cx, cy);
-        }
-        const mutated = await waitForMutation(200);
+        const click = target.element ? () => clickElementCenter2(target.element) : await Promise.resolve().then(() => (init_ops(), exports_ops)).then(({ clickAtViewport: clickAtViewport3 }) => () => clickAtViewport3(cx, cy));
+        const mutation = waitForMutation(200);
+        click();
+        const mutated = await mutation;
         const afterSelection = canvasSelected(profileOverride);
         const changed = mutated || selectionChanged(beforeSelection.data, afterSelection.data);
         return {
@@ -4635,11 +4754,9 @@ async function handleAction(action) {
   if (wantChanges)
     cacheSnapshot();
   const result = await executeAction(action);
-  const sw = getStaleWarning();
-  if (sw && result.success)
-    result.warning = sw;
-  else if (warnDirty && result.success)
-    result.warning = "DOM has changed since last state read";
+  const note = getStaleWarning() ?? (warnDirty ? "DOM has changed since last state read" : null);
+  if (note && result.success)
+    result.warning = result.warning ? `${result.warning}; ${note}` : note;
   if (wantChanges && result.success) {
     const diffResult = computeSnapshotDiff();
     if (diffResult.success)
@@ -4654,6 +4771,8 @@ async function executeAction(action) {
         return getPageState(action.full);
       case "click":
         return handleClick(action);
+      case "click_selector":
+        return handleClickSelector(action);
       case "dblclick":
         return handleDblclick(action);
       case "rightclick":

@@ -3,6 +3,17 @@ import { describe, expect, test } from "bun:test"
 import { classify, gate, parseAllow } from "../cli/mcp/tiers"
 
 describe("classify — tier by (surface, verb, sub-verb)", () => {
+  test("task verification is arbitrary exec even with reordered flags", () => {
+    for (const surface of ["browser", "local"] as const) {
+      for (const op of ["verify", "complete", "unknown"]) {
+        const c = classify(surface, "monitor", ["--json", "task", op, "task-id"])
+        expect(c.tier).toBe("exec")
+        expect(gate(c, parseAllow(undefined), true).allowed).toBe(false)
+      }
+      expect(classify(surface, "monitor", ["task", "resume", "task-id"]).tier).toBe("read")
+      expect(classify(surface, "monitor", ["--file", "x", "task", "checkpoint", "task-id"]).tier).toBe("mutate")
+    }
+  })
   test("browser reads/mutates/exec", () => {
     expect(classify("browser", "tree", []).tier).toBe("read")
     expect(classify("browser", "text", []).tier).toBe("read")
@@ -112,5 +123,37 @@ describe("gate — operator allowlist is the boundary; confirm is a speed-bump",
     expect(gate(eEval, parseAllow("destructive"), true).allowed).toBe(false)
     expect(gate(eEval, parseAllow("arbitrary-exec"), true).allowed).toBe(true)
     expect(gate(eEval, parseAllow("all"), true).allowed).toBe(true)
+  })
+})
+
+describe("issue #244 vault, sudo, admin prompt, auth", () => {
+  test("macos secret family: list/status read, register/set/unlock/lock mutate, rm destructive, reveal exec, unknown floors destructive", () => {
+    expect(classify("macos", "secret", ["list"]).tier).toBe("read")
+    expect(classify("macos", "secret", ["status"]).tier).toBe("read")
+    expect(classify("macos", "secret", ["register", "admin"]).tier).toBe("mutate")
+    expect(classify("macos", "secret", ["set", "admin", "--stdin"]).tier).toBe("mutate")
+    expect(classify("macos", "secret", ["unlock", "admin", "--for", "30m"]).tier).toBe("mutate")
+    expect(classify("macos", "secret", ["lock"]).tier).toBe("mutate")
+    expect(classify("macos", "secret", ["rm", "admin"]).tier).toBe("destructive")
+    expect(classify("macos", "secret", ["reveal", "admin"]).tier).toBe("exec")
+    expect(classify("macos", "secret", ["export"]).tier).toBe("destructive")
+  })
+
+  test("sudo is exec, authdialog fill destructive, authdialog status read", () => {
+    expect(classify("macos", "sudo", ["--secret", "admin", "--", "id"]).tier).toBe("exec")
+    expect(classify("macos", "authdialog", ["fill", "--secret", "admin"]).tier).toBe("destructive")
+    expect(classify("macos", "authdialog", ["status"]).tier).toBe("read")
+  })
+
+  test("auth is explicitly mutate; status reads", () => {
+    expect(classify("macos", "auth", ["confirm", "why"]).tier).toBe("mutate")
+    expect(classify("macos", "auth", ["status"]).tier).toBe("read")
+  })
+
+  test("the gate refuses sudo and reveal without operator opt-in", () => {
+    const allow = parseAllow(undefined)
+    expect(gate(classify("macos", "sudo", ["--secret", "a", "--", "id"]), allow, true).allowed).toBe(false)
+    expect(gate(classify("macos", "secret", ["reveal", "a"]), allow, true).allowed).toBe(false)
+    expect(gate(classify("macos", "secret", ["list"]), allow, false).allowed).toBe(true)
   })
 })

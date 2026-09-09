@@ -18,6 +18,12 @@ let wsReconnectTimer: ReturnType<typeof setTimeout> | null = null
 
 let wsChannel: WebSocket | null = null
 let wsReady = false
+// Half-open detection state: keepalives sent since the last inbound ws frame,
+// and whether this connection's daemon has acked one (older daemons never do).
+// All transitions go through the pure reducers below (wsStateOn*) so the
+// stateful behavior — send increments, inbound resets, ack arms, open clears —
+// is unit-testable without a live socket.
+let wsKeepalive: WsKeepaliveState = { keepalivesSinceAck: 0, ackSupported: false }
 let wsKeepAliveTimer: ReturnType<typeof setInterval> | null = null
 let keepalivePongTimer: ReturnType<typeof setTimeout> | null = null
 let pendingHandshakePort: chrome.runtime.Port | null = null
@@ -25,10 +31,14 @@ let lastNativeActivityAt = 0
 const WS_URL = "ws://localhost:19222"
 let configuredContextId: string | null = null
 let forceWebSocketTransport = false
+let WebSocketImpl = globalThis.WebSocket
 let safariNativeRelayEnabled = false
 let safariNativeRelayClient: SafariNativeRelayClient | null = null
 export const NATIVE_KEEPALIVE_PONG_TIMEOUT_MS = 15_000
 export const RECENT_NATIVE_ACTIVITY_GRACE_MS = 10_000
+// After this many consecutive keepalives sent with no inbound frame in reply
+// (~40s at the 20s interval), treat the ws as half-open and force a reconnect.
+export const WS_KEEPALIVE_MISS_LIMIT = 2
 const OUTBOUND_RECOVERY_QUEUE_CAP = 50
 const outboundRecoveryQueue: unknown[] = []
 
@@ -36,6 +46,8 @@ export type ExtensionTransportConfig = {
   contextId?: string
   forceWebSocket?: boolean
   safariNativeRelay?: boolean
+  /** Test/host injection; production entrypoints use the runtime WebSocket. */
+  webSocketImpl?: typeof WebSocket
 }
 
 /** Configure an entrypoint before it registers listeners or opens a channel. */
@@ -45,6 +57,34 @@ export function configureTransport(config: ExtensionTransportConfig): void {
   }
   forceWebSocketTransport = config.forceWebSocket === true
   safariNativeRelayEnabled = config.safariNativeRelay === true
+  if (config.webSocketImpl) WebSocketImpl = config.webSocketImpl
+}
+
+/** Restore injected entrypoint configuration between tests. */
+export function resetTransportForTesting(): void {
+  const channel = wsChannel
+  wsChannel = null
+  if (channel) {
+    channel.onopen = null
+    channel.onmessage = null
+    channel.onclose = null
+    channel.onerror = null
+    try { channel.close() } catch {}
+  }
+  stopWsKeepAlive()
+  if (wsReconnectTimer) clearTimeout(wsReconnectTimer)
+  wsReconnectTimer = null
+  wsReady = false
+  wsKeepalive = wsStateOnOpen()
+  wsReconnectDelay = INITIAL_RECONNECT_DELAY_MS
+  isConnecting = false
+  safariNativeRelayClient?.stop()
+  safariNativeRelayClient = null
+  if (activeTransport === "websocket" || activeTransport === "safari-native") activeTransport = "none"
+  configuredContextId = null
+  forceWebSocketTransport = false
+  safariNativeRelayEnabled = false
+  WebSocketImpl = globalThis.WebSocket
 }
 
 function describeOutboundMessage(msg: unknown): string {
@@ -97,7 +137,7 @@ function postNative(msg: unknown, port = nativePort): boolean {
 }
 
 function isWsOpen(): boolean {
-  if (!wsReady || !wsChannel || wsChannel.readyState !== WebSocket.OPEN) return false
+  if (!wsReady || !wsChannel || wsChannel.readyState !== WebSocketImpl.OPEN) return false
   return true
 }
 
@@ -121,7 +161,7 @@ function markWsRegistered(): void {
 
 function sendWs(msg: unknown): boolean {
   const channel = wsChannel
-  if (!wsReady || !channel || channel.readyState !== WebSocket.OPEN) return false
+  if (!wsReady || !channel || channel.readyState !== WebSocketImpl.OPEN) return false
   try {
     channel.send(JSON.stringify(msg))
     return true
@@ -130,10 +170,16 @@ function sendWs(msg: unknown): boolean {
   }
 }
 
+function extensionVersion(): string | undefined {
+  try { return chrome.runtime.getManifest().version } catch { return undefined }
+}
+
 function sendWsRegistration(ws: WebSocket, contextId: string): boolean {
   markWsUnregistered()
   try {
-    ws.send(JSON.stringify({ type: "extension", contextId }))
+    // Issue #241: the daemon records which extension build is connected so
+    // `interceptor diagnose` can show a stale snapshot next to the CLI version.
+    ws.send(JSON.stringify({ type: "extension", contextId, version: extensionVersion() }))
     return true
   } catch (err) {
     console.error("ws context registration send error:", err)
@@ -200,7 +246,7 @@ export function sendToHost(msg: unknown, forceWs?: boolean, allowQueue = false):
 
 function scheduleWsReconnect(): void {
   if (wsReconnectTimer) return
-  if (wsChannel && (wsChannel.readyState === WebSocket.OPEN || wsChannel.readyState === WebSocket.CONNECTING)) return
+  if (wsChannel && (wsChannel.readyState === WebSocketImpl.OPEN || wsChannel.readyState === WebSocketImpl.CONNECTING)) return
   const delay = delayWithJitter(wsReconnectDelay)
   wsReconnectTimer = setTimeout(() => {
     wsReconnectTimer = null
@@ -379,15 +425,71 @@ export function connectSafariNativeRelayChannel(): void {
   safariNativeRelayClient.start()
 }
 
+// Half-open detection state, threaded through pure reducers so every
+// transition is testable without a live socket.
+export type WsKeepaliveState = { keepalivesSinceAck: number; ackSupported: boolean }
+
+// A fresh socket: no unacked keepalives, and `ackSupported` re-learned from
+// THIS connection's first ack rather than inherited. Resetting ackSupported per
+// connection is what keeps the gate honest — a daemon that acked on a prior
+// socket but was replaced by a non-acking build won't leave the flag latched
+// true and false-positive-reconnect a healthy but unacked connection.
+export function wsStateOnOpen(): WsKeepaliveState {
+  return { keepalivesSinceAck: 0, ackSupported: false }
+}
+
+// A keepalive just went out with no reply yet.
+export function wsStateOnKeepaliveSent(state: WsKeepaliveState): WsKeepaliveState {
+  return { ...state, keepalivesSinceAck: state.keepalivesSinceAck + 1 }
+}
+
+// Any inbound frame proves the read side is alive — clear the staleness count.
+export function wsStateOnInboundFrame(state: WsKeepaliveState): WsKeepaliveState {
+  return { ...state, keepalivesSinceAck: 0 }
+}
+
+// A keepalive_ack: this daemon supports acks, so arm half-open detection.
+export function wsStateOnAck(state: WsKeepaliveState): WsKeepaliveState {
+  return { ...state, ackSupported: true }
+}
+
+/**
+ * Decide, from inside the outbound keepalive timer, whether the ws is half-open
+ * (OPEN at the OS layer but its read side is silently severed — the post-MV3-
+ * hibernation failure mode). The outbound setInterval is the one callback that
+ * keeps firing while ws.onmessage is wedged, so it must be the detector. Gated
+ * on `ackSupported` (set only after this connection's first keepalive_ack)
+ * so a daemon that never acks can't trip a permanent false-positive reconnect
+ * loop. Pure so the gate is unit-testable.
+ */
+export function shouldForceWsReconnect(
+  ackSupported: boolean,
+  keepalivesSinceAck: number,
+  missLimit: number,
+): boolean {
+  return ackSupported && keepalivesSinceAck >= missLimit
+}
+
 function startWsKeepAlive(): void {
   if (wsKeepAliveTimer) clearInterval(wsKeepAliveTimer)
   wsKeepAliveTimer = setInterval(() => {
-    if (!wsChannel || wsChannel.readyState !== WebSocket.OPEN) {
+    const channel = wsChannel
+    if (!channel || channel.readyState !== WebSocketImpl.OPEN) {
       if (wsKeepAliveTimer) clearInterval(wsKeepAliveTimer)
       wsKeepAliveTimer = null
       return
     }
-    try { wsChannel.send(JSON.stringify({ type: "keepalive", timestamp: Date.now() })) } catch {}
+    if (shouldForceWsReconnect(wsKeepalive.ackSupported, wsKeepalive.keepalivesSinceAck, WS_KEEPALIVE_MISS_LIMIT)) {
+      console.error(`ws inbound stale (${wsKeepalive.keepalivesSinceAck} unacked keepalives) — forcing reconnect`)
+      // Route through the shared teardown so onclose/backoff/reconnect run
+      // exactly as they do for a clean close — no bespoke reconnect timer.
+      closeWsForReconnect(channel)
+      return
+    }
+    try {
+      channel.send(JSON.stringify({ type: "keepalive", timestamp: Date.now() }))
+      wsKeepalive = wsStateOnKeepaliveSent(wsKeepalive)
+    } catch {}
   }, 20_000)
 }
 
@@ -422,9 +524,9 @@ export function connectWsChannel(): void {
     connectSafariNativeRelayChannel()
     return
   }
-  if (wsChannel && (wsChannel.readyState === WebSocket.OPEN || wsChannel.readyState === WebSocket.CONNECTING)) return
+  if (wsChannel && (wsChannel.readyState === WebSocketImpl.OPEN || wsChannel.readyState === WebSocketImpl.CONNECTING)) return
   try {
-    const ws = new WebSocket(WS_URL)
+    const ws = new WebSocketImpl(WS_URL)
     wsChannel = ws
     ws.onopen = async () => {
       if (wsChannel !== ws) {
@@ -436,13 +538,17 @@ export function connectWsChannel(): void {
         clearTimeout(wsReconnectTimer)
         wsReconnectTimer = null
       }
+      // Fresh socket: reset staleness AND re-learn ack support from this
+      // connection's first ack (see wsStateOnOpen — don't inherit a prior
+      // socket's capability flag).
+      wsKeepalive = wsStateOnOpen()
       startWsKeepAlive()
       const contextId = await getOrCreateContextId()
       if (wsChannel !== ws) {
         try { ws.close() } catch {}
         return
       }
-      if (ws.readyState !== WebSocket.OPEN) return
+      if (ws.readyState !== WebSocketImpl.OPEN) return
       if (!sendWsRegistration(ws, contextId)) {
         closeWsForReconnect(ws)
         return
@@ -451,8 +557,16 @@ export function connectWsChannel(): void {
     }
     ws.onmessage = (event) => {
       if (wsChannel !== ws) return
+      // Any inbound frame proves the read side is alive — clear the half-open
+      // counter regardless of the frame's kind.
+      wsKeepalive = wsStateOnInboundFrame(wsKeepalive)
       try {
         const msg = JSON.parse(typeof event.data === "string" ? event.data : "")
+        if (msg?.type === "keepalive_ack") {
+          // First ack on this connection: arm half-open detection.
+          wsKeepalive = wsStateOnAck(wsKeepalive)
+          return
+        }
         console.log("ws onmessage:", JSON.stringify(msg).slice(0, 200))
         handleControlPlaneMessage(msg, "websocket")
       } catch (err) {
@@ -510,7 +624,7 @@ export function registerStorageContextListener(): void {
     if (area !== "local" || !changes.contextId) return
     const newId = changes.contextId.newValue
     if (typeof newId !== "string" || newId.length === 0) return
-    if (!newId || !wsChannel || wsChannel.readyState !== WebSocket.OPEN) return
+    if (!newId || !wsChannel || wsChannel.readyState !== WebSocketImpl.OPEN) return
     const channel = wsChannel
     if (!sendWsRegistration(channel, newId)) {
       closeWsForReconnect(channel)

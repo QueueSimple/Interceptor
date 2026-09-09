@@ -1,8 +1,9 @@
 import {
   addTabToInterceptorGroup, ensureInterceptorGroup, interceptorGroupId,
   GROUP_LABEL_RE, ensureNamedGroup, addTabToNamedGroup, labelForGroupId,
-  namedGroups, hydrateNamedGroups, groupTitleFor
+  namedGroups, hydrateNamedGroups, groupTitleFor, hasTabGroupApi, managedGroupWindows
 } from "../tab-group"
+import { resolveTabLifecycle, policyMayDecideReuse } from "../tab-lifecycle"
 import { waitForTabLoad } from "../content-bridge"
 
 type ActionResult = { success: boolean; error?: string; data?: unknown; tabId?: number }
@@ -17,6 +18,61 @@ function activeTabKey(group?: string): string {
 function sessionArea(): chrome.storage.StorageArea {
   const storage = chrome.storage as typeof chrome.storage & { session?: chrome.storage.StorageArea }
   return storage.session ?? chrome.storage.local
+}
+
+// Resolve a normal (groupable) window to birth a new tab in. Precedence:
+//   1. the window that already holds the caller's own group (named label, else
+//      the default group) — so chrome.tabs.group never drags the tab across
+//      windows to join it;
+//   2. a window that already hosts ANY managed group (the focused one first,
+//      then the one holding most, then getAll order) — agent tabs stay together
+//      instead of following the user's focus into a fresh window, which used to
+//      scatter one new per-session group into every window the user touched;
+//   3. the focused normal window, else the first normal window, else create one.
+// Without an explicit windowId, chrome.tabs.create opens in whatever window
+// last had focus — which may be a popup, devtools, or app window, and tabs
+// there can't be grouped (chrome.tabs.group rejects with "Tabs can only be
+// moved to and from normal windows"). Returns {} when chrome.windows is
+// unavailable (MV2/Electron) so the caller falls back to chrome.tabs.create's
+// default placement.
+//
+// The create-a-window branch carries the target url INTO chrome.windows.create
+// and returns the window's initial tab as `createdTab`: creating an empty
+// window ships a New Tab Page tab, and a subsequent tabs.create would add a
+// second tab next to that orphan NTP. With the url in create, the window's one
+// tab IS the requested tab.
+export type NormalWindowPlacement = { windowId?: number; createdTab?: chrome.tabs.Tab }
+
+// Grouping is tolerated-to-fail, but a caller relying on per-agent isolation
+// must see when it didn't happen. -1 with the group API present = a real
+// failure worth surfacing; -1 without the API (MV2/Electron) is just normal.
+export function groupWarningFor(groupId: number, groupApiAvailable: boolean): string | undefined {
+  if (groupId === -1 && groupApiAvailable) {
+    return "tab was not added to a tab group (non-normal window or transient group failure) — per-agent group isolation is not in effect for this tab"
+  }
+  return undefined
+}
+
+export async function resolveNormalWindowPlacement(focusNew: boolean, url: string, group?: string): Promise<NormalWindowPlacement> {
+  if (!chrome.windows || typeof chrome.windows.getAll !== "function") return {}
+  try {
+    const normal = await chrome.windows.getAll({ windowTypes: ["normal"] })
+    const home = await managedGroupWindows(group)
+    if (home.own !== undefined && normal.some(w => w.id === home.own)) return { windowId: home.own }
+    const hosting = normal
+      .filter(w => w.id !== undefined && home.hosting.has(w.id))
+      .sort((a, b) => (home.hosting.get(b.id as number) ?? 0) - (home.hosting.get(a.id as number) ?? 0))
+    const pool = hosting.length > 0 ? hosting : normal
+    const existing = pool.find(w => w.focused)?.id ?? pool[0]?.id
+    if (existing !== undefined) return { windowId: existing }
+    if (typeof chrome.windows.create === "function") {
+      const created = await chrome.windows.create({ url, focused: focusNew })
+      return { windowId: created?.id, createdTab: created?.tabs?.[0] }
+    }
+  } catch {
+    // fall through — let chrome.tabs.create pick a window
+  }
+  return {}
 }
 
 export async function handleTabActions(
@@ -40,7 +96,22 @@ export async function handleTabActions(
       // keeps one agent's --reuse from hijacking another agent's tab
       // (per-agent isolation). Falls back to creating a new tab if the group is empty
       // or the candidate tab disappeared between query and update.
-      if (action.reuse) {
+      //
+      // Policy default: `open` marks reuse-undecided calls with
+      // `reusePolicy` and the resolved tabLifecycle policy decides — but ONLY
+      // for named groups. In the shared default group "most recent tab" can be
+      // a sibling agent's, so the policy never engages there; explicit --reuse
+      // (action.reuse === true) still works everywhere, --no-reuse
+      // (action.reuse === false) blocks both paths.
+      let reuseWanted = action.reuse === true
+      if (!reuseWanted && policyMayDecideReuse(action)) {
+        try {
+          reuseWanted = (await resolveTabLifecycle()).policy.reuse
+        } catch {
+          reuseWanted = false
+        }
+      }
+      if (reuseWanted) {
         const groupId = group ? await ensureNamedGroup(group) : await ensureInterceptorGroup()
         if (groupId !== -1) {
           const groupTabs = await chrome.tabs.query({ groupId })
@@ -50,29 +121,31 @@ export async function handleTabActions(
               .sort((a, b) => (b.id as number) - (a.id as number))
             const candidate = sorted[0]
             if (candidate?.id !== undefined) {
-              // Reuse path: preserve the candidate tab's current
-              // active/inactive state by default — navigating a background
-              // tab keeps it in the background, a foreground tab stays
-              // foreground. Only pass `active: true` when the caller
-              // explicitly asked for activation via `action.active`, so
-              // `interceptor open <url> --reuse --activate` foregrounds
-              // the reused tab on demand without disturbing the user's
-              // focus on every routine reuse call.
-              const reuseActivate = (action.active as boolean | undefined) === true
-              const updateProps: chrome.tabs.UpdateProperties = { url: targetUrl }
-              if (reuseActivate) updateProps.active = true
-              let updated: chrome.tabs.Tab | undefined
               try {
-                updated = await chrome.tabs.update(candidate.id, updateProps)
-              } catch {
-                // Tab vanished between query and update — fall through to create.
-              }
-              if (updated) {
-                // Only the vanished-tab case falls through. A load timeout is
-                // NOT a reuse failure — the tab is already navigating, and
-                // falling through here would navigate one tab AND create a
-                // second, leaving two candidates for the next command.
-                try { await waitForTabLoad(candidate.id) } catch {}
+                // Reuse path: preserve the candidate tab's current
+                // active/inactive state by default — navigating a background
+                // tab keeps it in the background, a foreground tab stays
+                // foreground. Only pass `active: true` when the caller
+                // explicitly asked for activation via `action.active`, so
+                // `interceptor open <url> --reuse --activate` foregrounds
+                // the reused tab on demand without disturbing the user's
+                // focus on every routine reuse call.
+                const reuseActivate = (action.active as boolean | undefined) === true
+                // `websearch` needs a managed destination before the browser's
+                // provider API navigates it. In prepare-only mode, reuse the
+                // candidate in place rather than blanking it first; activation
+                // remains the same explicit opt-in as ordinary tab creation.
+                let updated: chrome.tabs.Tab | undefined = candidate
+                if (action.prepareOnly === true) {
+                  updated = reuseActivate
+                    ? await chrome.tabs.update(candidate.id, { active: true })
+                    : await chrome.tabs.get(candidate.id)
+                } else {
+                  const updateProps: chrome.tabs.UpdateProperties = { url: targetUrl }
+                  if (reuseActivate) updateProps.active = true
+                  updated = await chrome.tabs.update(candidate.id, updateProps)
+                  await waitForTabLoad(candidate.id)
+                }
                 // Pin the reused tab as the auto-target for subsequent commands.
                 // Mirrors the new-tab path below: every successful tab_create
                 // — whether new or reused — must update the (per-group)
@@ -81,8 +154,10 @@ export async function handleTabActions(
                 await sessionArea().set({ [activeTabKey(group)]: candidate.id })
                 return {
                   success: true,
-                  data: { tabId: candidate.id, url: updated.url ?? targetUrl, groupId, group, reused: true }
+                  data: { tabId: candidate.id, url: updated?.url ?? targetUrl, windowId: updated?.windowId ?? candidate.windowId, groupId, group, reused: true }
                 }
+              } catch {
+                // Tab vanished between query and update — fall through to create.
               }
             }
           }
@@ -94,17 +169,35 @@ export async function handleTabActions(
       // --activate` is the explicit opt-in). Callers pass `action.active:
       // true` only when the new tab is genuinely meant to be foregrounded.
       const shouldActivate = (action.active as boolean | undefined) === true
-      const newTab = await chrome.tabs.create({ url: targetUrl, active: shouldActivate })
+      // Pin creation to a normal window so the tab is groupable, homing on the
+      // window that already holds the caller's group / any managed group (see
+      // resolveNormalWindowPlacement). When a window had to be created, its
+      // initial tab already carries the url — creating another would leave an
+      // orphan NTP tab. Empty placement → chrome.tabs.create's default.
+      const placement = await resolveNormalWindowPlacement(shouldActivate, targetUrl, group)
+      const newTab = placement.createdTab ?? await chrome.tabs.create({
+        url: targetUrl,
+        active: shouldActivate,
+        ...(placement.windowId !== undefined ? { windowId: placement.windowId } : {})
+      })
       if (newTab.id) {
         const groupId = group
           ? await addTabToNamedGroup(newTab.id, group, action.groupColor)
           : await addTabToInterceptorGroup(newTab.id)
+        // Chrome may deactivate a newly-created active tab while moving it
+        // into a tab group. Reassert the caller's explicit activation only
+        // after group placement completes. This changes the active tab inside
+        // the existing browser window but does not focus the browser window.
+        if (shouldActivate) await chrome.tabs.update(newTab.id, { active: true })
         // Pin the newly-created tab as the auto-target for subsequent commands
         // so a fresh CLI invocation (no --tab) routes to this tab instead of a
         // stale activeTabId or whatever Chrome reports as "active in currentWindow"
         // (which may be the user's foreground tab, not the one we just opened).
         await sessionArea().set({ [activeTabKey(group)]: newTab.id })
-        return { success: true, data: { tabId: newTab.id, url: newTab.url, groupId, group, reused: false } }
+        const data: Record<string, unknown> = { tabId: newTab.id, url: newTab.url, windowId: newTab.windowId, groupId, group, reused: false }
+        const groupWarning = groupWarningFor(groupId, hasTabGroupApi())
+        if (groupWarning) data.groupWarning = groupWarning
+        return { success: true, data }
       }
       return { success: true, data: { tabId: newTab.id, url: newTab.url, reused: false } }
     }
@@ -124,45 +217,12 @@ export async function handleTabActions(
       return { success: true }
     }
 
-    case "tab_sweep": {
-      // Close every tab in the DEFAULT Interceptor group in one call; tabs
-      // outside the group are never touched (named groups are closed via
-      // group_close). No-op (success, count 0) when the group doesn't exist.
-      const groupId = await ensureInterceptorGroup()
-      if (groupId === -1) return { success: true, data: { closed: [], count: 0 } }
-      const groupTabs = await chrome.tabs.query({ groupId })
-      const ids = groupTabs.map(t => t.id).filter((id): id is number => typeof id === "number")
-      // Remove per-id: a batched remove([ids]) rejects wholesale if any one
-      // tab vanished between query and remove, stranding the rest open.
-      const closed: number[] = []
-      for (const id of ids) {
-        try {
-          await chrome.tabs.remove(id)
-          closed.push(id)
-        } catch {
-          // Already gone (user or race) — the desired end state.
-        }
-      }
-      const stored = await sessionArea().get("activeTabId") as { activeTabId?: number }
-      if (stored.activeTabId !== undefined && ids.includes(stored.activeTabId)) {
-        await sessionArea().remove("activeTabId")
-      }
-      return { success: true, data: { closed, count: closed.length } }
-    }
-
     case "tab_switch": {
-      const target = await chrome.tabs.update(action.tabId as number, { active: true })
-      // active:true selects the tab within its own window but does not focus
-      // that window — in a multi-window session the "explicit focus move"
-      // must also bring the window forward or screenshots capture whatever
-      // window Chrome is actually showing.
-      if (target?.windowId !== undefined) {
-        await chrome.windows.update(target.windowId, { focused: true })
-      }
       // No auto-target write here: the dispatcher's post-gate persist already
       // stored the switch target under the caller's (per-group or global) key;
       // a handler-side global write would clobber the ungrouped key on
       // grouped switches.
+      await chrome.tabs.update(action.tabId as number, { active: true })
       return { success: true }
     }
 
@@ -189,7 +249,7 @@ export async function handleTabActions(
       }
       await ensureInterceptorGroup()
       await hydrateNamedGroups()
-      const live = await chrome.tabGroups.query({})
+      const live = await chrome.tabGroups.query({}).catch(() => []) // windowless profile → no groups (issue #162)
       // Re-adopt named groups the registry lost (e.g. browser restart restored
       // the window): exact match on the brand-composed `<brand>-<label>` title.
       // ponytail: current brand prefix only; a pre-rebrand title is re-adopted on the next brand change
