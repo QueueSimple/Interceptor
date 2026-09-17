@@ -39,6 +39,7 @@ import { IOS_ACTION_TYPES, IOS_CONTEXT_PREFIX, IOS_REGISTER_TYPE, IOS_VERB_TYPES
 import { IOS_WEB_ACTION_TYPES } from "../shared/ios-web"
 import { IOS_SVC_ACTION_TYPES } from "../shared/ios-service"
 import { IOS_DEV_ACTION_TYPES } from "../shared/ios-dev"
+import { refuseUntrustedCaller } from "./caller-guard"
 import {
   NATIVE_REGISTER_TYPE, NATIVE_DELEGATE_TYPE, NATIVE_CONTEXT_PREFIX,
   type NativeAgentState, type CodeSlice, type NativeWayIn,
@@ -2130,6 +2131,9 @@ function startWsServer(): ReturnType<typeof Bun.serve> {
   return Bun.serve<undefined>({
     port: WS_PORT,
     fetch(req, server) {
+      // Local patch 2026-09-17: judge every caller before a session opens (see caller-guard.ts).
+      const refusal = refuseUntrustedCaller(req, server.requestIP(req)?.address)
+      if (refusal) return refusal
       if (server.upgrade(req, {})) return
       if (new URL(req.url).pathname === "/health") {
         return Response.json({ service: DAEMON_HEALTH_SERVICE, pid: process.pid, version: VERSION, wsPort: WS_PORT, healed: healRuntimeFiles("health probe") })
