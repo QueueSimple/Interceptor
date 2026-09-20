@@ -40,6 +40,14 @@ export function parseScreenshotCommand(filtered: string[]): Action {
       }
       if (filtered.includes("--element")) ssAction.element = parseInt(filtered[filtered.indexOf("--element") + 1])
       if (filtered.includes("--ref")) ssAction.ref = filtered[filtered.indexOf("--ref") + 1]
+      // --label names the saved file (cli/index.ts reads action.label to build
+      // SCREENSHOTS/<day>/<time>-<label>.<ext>). 7e26d14 deleted this line on the
+      // premise that nothing downstream read the field; index.ts:525 does, so the
+      // save-path implementation sat stranded and every shot was timestamp-only.
+      // Restored WITH the normalize.ts declaration this time — undeclared flags
+      // are dropped, which is the silent failure that motivated 7e26d14.
+      // --out stays deleted on purpose: upstream traps it in favour of --save.
+      if (filtered.includes("--label")) ssAction.label = filtered[filtered.indexOf("--label") + 1]
       if (filtered.includes("--target-max-long-edge")) {
         const raw = filtered[filtered.indexOf("--target-max-long-edge") + 1]
         const parsed = parseInt(raw)
