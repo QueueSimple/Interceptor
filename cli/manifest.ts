@@ -170,6 +170,18 @@ export const COMMAND_SPECS: CommandSpec[] = [
   // ── tabs / network / capture / data ─────────────────────────────────────────
   { name: "tabs", surface: "browser", usage: "interceptor tabs", summary: "List managed tabs", returns: "Tab list (id, url, title)." },
   {
+    name: "viewport", surface: "browser",
+    usage: "interceptor viewport [<width> [height] [--mobile] [--dpr <n>] | reset] [--tab <id>]",
+    summary: "Set, get, or reset a persistent CSS viewport without focusing the tab (Chrome debugger emulation)",
+    returns: "{width,height,deviceScaleFactor,mobile} for set/get; null when no override or after reset. Defaults: height 800, dpr 1, mobile false. Debugger stays attached until reset or Chrome/user detachment; network capture retains its session.",
+    flags: [
+      { name: "--mobile", description: "enable mobile viewport emulation" },
+      { name: "--dpr", value: "<n>", description: "positive device scale factor (default 1)" },
+      { name: "--tab", value: "<id>", description: "target tab ID" },
+    ],
+    example: "interceptor viewport 390 844 --mobile --dpr 3",
+  },
+  {
     name: "tab", surface: "browser",
     usage: "interceptor tab new [url] [--reuse|--no-reuse] [--activate] | tab close [id] | tab switch <id>",
     summary: "Create, reuse, activate, or close managed tabs",

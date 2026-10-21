@@ -104,7 +104,7 @@ const VALUE_FLAGS_BY_CMD: Record<string, string[]> = {
   // navigation
   navigate: NAV, back: NAV, forward: NAV, scroll: NAV, wait: NAV, "wait-stable": NAV, wait_for: NAV,
   // tabs (window carries the resize value flags; the rest are boolean-only)
-  tabs: [], tab: [], window: WINDOW, frames: [], session: [],
+  tabs: [], tab: [], window: WINDOW, viewport: ["--dpr"], frames: [], session: [],
   // network
   network: NET, net: NET, headers: NET,
   // screenshot
@@ -158,7 +158,7 @@ const BOOLEAN_FLAGS_BY_CMD: Record<string, string[]> = {
   hover: ACTIONS_BOOL, drag: ACTIONS_BOOL, dblclick: ACTIONS_BOOL, rightclick: ACTIONS_BOOL,
   check: ACTIONS_BOOL, keys: ACTIONS_BOOL, "click-at": ACTIONS_BOOL, "what-at": ACTIONS_BOOL, regions: ACTIONS_BOOL,
   navigate: [], back: [], forward: [], scroll: [], wait: [], "wait-stable": [], wait_for: [],
-  tabs: TABS_BOOL, tab: TAB_BOOL, window: TABS_BOOL, frames: [], session: [],
+  tabs: TABS_BOOL, tab: TAB_BOOL, window: TABS_BOOL, viewport: ["--mobile"], frames: [], session: [],
   network: NET_BOOL, net: NET_BOOL, headers: NET_BOOL,
   screenshot: SCREENSHOT_BOOL, canvas: SCREENSHOT_BOOL, capture: SCREENSHOT_BOOL, ocr: SCREENSHOT_BOOL,
   cookies: DATA_BOOL, storage: DATA_BOOL, history: DATA_BOOL, bookmarks: DATA_BOOL, downloads: DATA_BOOL, clear: DATA_BOOL, clipboard: DATA_BOOL,

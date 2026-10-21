@@ -7,6 +7,7 @@
 import { unlinkSync } from "node:fs"
 import { writeFileSync } from "node:fs"
 import { buildTabCreateAction } from "./compound"
+import { buildViewportAction } from "./viewport"
 
 type Action = { type: string; [key: string]: unknown }
 
@@ -126,6 +127,13 @@ export async function parseTabsCommand(filtered: string[]): Promise<Action | nul
   const cmd = filtered[0]
 
   switch (cmd) {
+    case "viewport":
+      try {
+        return buildViewportAction(filtered.slice(1))
+      } catch (err) {
+        die((err as Error).message)
+      }
+
     case "tabs":
       return { type: "tab_list" }
 

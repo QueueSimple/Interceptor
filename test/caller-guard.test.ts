@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test"
 import { refuseUntrustedCaller } from "../daemon/caller-guard"
 
 function request(origin?: string): Request {
-  const headers = origin === undefined ? {} : { origin }
+  const headers: Record<string, string> = origin === undefined ? {} : { origin }
   return new Request("http://localhost:19222/", { headers })
 }
 

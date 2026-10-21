@@ -20,6 +20,7 @@ import { parseActionsCommand } from "./commands/actions"
 import { parsePowerCommand, runDelegateCommand } from "./commands/power"
 import { parseNavigationCommand } from "./commands/navigation"
 import { parseTabsCommand } from "./commands/tabs"
+import { buildViewportAction } from "./commands/viewport"
 import { parseNetworkCommand } from "./commands/network"
 import { parseScreenshotCommand } from "./commands/screenshot"
 import { parseDataCommand } from "./commands/data"
@@ -62,7 +63,7 @@ console.log = (...args: unknown[]): void => {
 const STATE_CMDS = new Set(["state", "tree", "diff", "find", "text", "html"])
 const ACTION_CMDS = new Set(["click", "type", "select", "focus", "blur", "hover", "drag", "upload", "dblclick", "rightclick", "check", "keys", "click-at", "what-at", "regions"])
 const NAV_CMDS = new Set(["navigate", "back", "forward", "scroll", "wait", "wait-stable", "wait_for"])
-const TAB_CMDS = new Set(["tabs", "tab", "window", "frames", "session"])
+const TAB_CMDS = new Set(["tabs", "tab", "window", "viewport", "frames", "session"])
 const NET_CMDS = new Set(["network", "net", "headers"])
 const SS_CMDS = new Set(["screenshot", "canvas", "capture", "ocr"])
 const DATA_CMDS = new Set(["cookies", "storage", "history", "bookmarks", "downloads", "clear", "clipboard"])
@@ -236,6 +237,9 @@ async function main() {
     process.exit(1)
   }
 
+  // Validate viewport dimensions before any daemon-spawning side effect.
+  const viewportAction = cmd === "viewport" ? buildViewportAction(filtered.slice(1)) : undefined
+
   // `websearch` validation happens before daemon auto-spawn so a malformed
   // invocation has no browser or process side effects. The retained `search`
   // alias uses the identical parser and lifecycle.
@@ -408,6 +412,7 @@ async function main() {
   if (STATE_CMDS.has(cmd))       action = parseStateCommand(filtered)
   else if (ACTION_CMDS.has(cmd)) action = parseActionsCommand(filtered, normalized.positionalCount)
   else if (NAV_CMDS.has(cmd))    action = parseNavigationCommand(filtered)
+  else if (viewportAction)      action = viewportAction
   else if (TAB_CMDS.has(cmd))    action = await parseTabsCommand(filtered)
   else if (NET_CMDS.has(cmd))    action = parseNetworkCommand(filtered)
   else if (SS_CMDS.has(cmd))     action = parseScreenshotCommand(filtered)
@@ -625,6 +630,10 @@ async function main() {
 
     // Pretty-print known result types
     if (!jsonMode && result.success) {
+      if (action.type === "viewport_get" && result.data === null) {
+        console.log("none")
+        return
+      }
       if (action.type === "get_state") {
         console.log(formatState(result.data as Parameters<typeof formatState>[0]))
         return

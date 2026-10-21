@@ -6,6 +6,7 @@ import { handleCaptureStreamActions } from "./capabilities/capture-stream"
 import { handleCanvasActions } from "./capabilities/canvas"
 import { handleTabActions } from "./capabilities/tabs"
 import { handleWindowActions } from "./capabilities/windows"
+import { handleViewportActions } from "./capabilities/viewport"
 import { handleNavigationActions } from "./capabilities/navigation"
 import { handleCookieActions } from "./capabilities/cookies"
 import { handleHistoryActions } from "./capabilities/history"
@@ -62,6 +63,7 @@ const WINDOW_ACTIONS = new Set([
   "window_create", "window_close", "window_focus", "window_resize", "window_list", "window_get_all"
 ])
 const NAVIGATION_ACTIONS = new Set(["navigate", "go_back", "go_forward", "reload"])
+const VIEWPORT_ACTIONS = new Set(["viewport_set", "viewport_reset", "viewport_get"])
 const COOKIE_ACTIONS = new Set(["cookies_get", "cookies_set", "cookies_delete"])
 const HISTORY_ACTIONS = new Set([
   "history_search", "history_visits", "history_delete", "history_delete_range", "history_delete_all"
@@ -107,6 +109,7 @@ export async function routeAction(
   if (CANVAS_ACTIONS.has(action.type)) return handleCanvasActions(action, tabId)
   if (TAB_ACTIONS.has(action.type)) return handleTabActions(action, tabId)
   if (WINDOW_ACTIONS.has(action.type)) return handleWindowActions(action, tabId)
+  if (VIEWPORT_ACTIONS.has(action.type)) return handleViewportActions(action, tabId)
   if (NAVIGATION_ACTIONS.has(action.type)) return handleNavigationActions(action, tabId)
   if (COOKIE_ACTIONS.has(action.type)) return handleCookieActions(action, tabId)
   if (HISTORY_ACTIONS.has(action.type)) return handleHistoryActions(action, tabId)

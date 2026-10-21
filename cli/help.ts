@@ -118,7 +118,7 @@ const MAP_BROWSER = `BROWSER — a signed-in Chrome/Brave profile, background ta
   Extract    table · links · images · forms · query <css> · exists · count · attr · style      structured JSON
   Act        act <ref> · click · type · select · focus · hover · drag · dblclick · rightclick · check · keys · scroll
   Navigate   navigate <url> · back · forward · scroll · wait <ms> · wait-stable
-  Tabs       tabs · tab new|close|switch · window · frames · session · group (per-agent isolation) · contexts
+  Tabs       tabs · tab new|close|switch · window · viewport · frames · session · group (per-agent isolation) · contexts
   Network    net (passive log → HAR/pcapng) · headers · override (rewrite requests) · sse
   Capture    screenshot [ref] · canvas · ocr · save --out <path> <expr>  (page bytes straight to disk) · eval <js> [--main]
   Data       cookies · storage · history · bookmarks · downloads · clipboard · clear
@@ -299,6 +299,10 @@ Tabs:
                                              Move and resize a browser window
   interceptor window resize --state maximized
                                              Change current window state; don't combine maximized/fullscreen/minimized with geometry
+  interceptor viewport <width> [height] [--mobile] [--dpr <n>] [--tab <id>]
+                                             Set persistent CSS viewport, including phone widths (height 800, dpr 1 by default)
+  interceptor viewport [--tab <id>]          Get current viewport override (none when unset; JSON null)
+  interceptor viewport reset [--tab <id>]    Clear viewport override; release its debugger session when unused
 
 Capture:
   interceptor screenshot                     Full-page DOM-render screenshot (default — works without focus)

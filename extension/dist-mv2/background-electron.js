@@ -594,6 +594,10 @@ async function disableNetworkCapture(tabId) {
   } catch {}
 }
 
+// extension/src/background/viewport-state.ts
+var viewportOverrides = new Map;
+var viewportDebuggerTabs = new Set;
+
 // extension/src/background/cdp.ts
 var debuggerAttached = new Set;
 async function cdpCommand(tabId, method, params) {
@@ -607,7 +611,7 @@ async function cdpCommand(tabId, method, params) {
     const result = await chrome.debugger.sendCommand(target, method, params);
     return result;
   } finally {
-    if (!isAttached) {
+    if (!isAttached && !viewportOverrides.has(tabId)) {
       try {
         await chrome.debugger.detach(target);
         debuggerAttached.delete(tabId);
@@ -2347,6 +2351,53 @@ async function handleWindowActions(action, _tabId) {
     return { success: false, error: `unknown window action: ${action.type}` };
   } catch (err) {
     return { success: false, error: err instanceof Error ? err.message : String(err) };
+  }
+}
+
+// extension/src/background/capabilities/viewport.ts
+function networkHoldsDebugger(tabId) {
+  return networkCaptureConfigs.get(tabId)?.enabled === true || (networkOverrideConfigs.get(tabId)?.length || 0) > 0 || fetchInterceptionEnabled.has(tabId);
+}
+async function releaseViewportDebugger(tabId) {
+  if (!viewportDebuggerTabs.has(tabId))
+    return;
+  if (!networkHoldsDebugger(tabId) && debuggerAttached.has(tabId)) {
+    await chrome.debugger.detach({ tabId });
+    debuggerAttached.delete(tabId);
+  }
+  viewportDebuggerTabs.delete(tabId);
+}
+async function handleViewportActions(action, tabId) {
+  switch (action.type) {
+    case "viewport_get":
+      return { success: true, data: viewportOverrides.get(tabId) ?? null };
+    case "viewport_set": {
+      const { width, height, deviceScaleFactor, mobile } = action;
+      if (typeof width !== "number" || !Number.isSafeInteger(width) || width <= 0 || typeof height !== "number" || !Number.isSafeInteger(height) || height <= 0 || typeof deviceScaleFactor !== "number" || !Number.isFinite(deviceScaleFactor) || deviceScaleFactor <= 0 || typeof mobile !== "boolean") {
+        return { success: false, error: "viewport requires positive integer width/height, positive dpr, and boolean mobile" };
+      }
+      const override = { width, height, deviceScaleFactor, mobile };
+      const openedForViewport = !debuggerAttached.has(tabId);
+      await ensureDebuggerSession(tabId);
+      if (openedForViewport)
+        viewportDebuggerTabs.add(tabId);
+      try {
+        await chrome.debugger.sendCommand({ tabId }, "Emulation.setDeviceMetricsOverride", override);
+        viewportOverrides.set(tabId, override);
+      } catch (err) {
+        if (openedForViewport)
+          await releaseViewportDebugger(tabId);
+        throw err;
+      }
+      return { success: true, data: override };
+    }
+    case "viewport_reset":
+      await cdpCommand(tabId, "Emulation.clearDeviceMetricsOverride");
+      viewportOverrides.delete(tabId);
+      await releaseViewportDebugger(tabId);
+      return { success: true, data: null };
+    default:
+      return { success: false, error: `unknown viewport action: ${action.type}` };
   }
 }
 
@@ -4825,6 +4876,7 @@ var WINDOW_ACTIONS = new Set([
   "window_get_all"
 ]);
 var NAVIGATION_ACTIONS = new Set(["navigate", "go_back", "go_forward", "reload"]);
+var VIEWPORT_ACTIONS = new Set(["viewport_set", "viewport_reset", "viewport_get"]);
 var COOKIE_ACTIONS = new Set(["cookies_get", "cookies_set", "cookies_delete"]);
 var HISTORY_ACTIONS = new Set([
   "history_search",
@@ -4907,6 +4959,8 @@ async function routeAction(action, tabId) {
     return handleTabActions(action, tabId);
   if (WINDOW_ACTIONS.has(action.type))
     return handleWindowActions(action, tabId);
+  if (VIEWPORT_ACTIONS.has(action.type))
+    return handleViewportActions(action, tabId);
   if (NAVIGATION_ACTIONS.has(action.type))
     return handleNavigationActions(action, tabId);
   if (COOKIE_ACTIONS.has(action.type))

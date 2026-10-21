@@ -4,6 +4,7 @@ import {
   applyNetworkOverrideRule, matchesCapturePatterns, truncateBody,
   appendNetworkLog, clearNetworkLogs
 } from "./network-capture"
+import { clearViewportState, viewportOverrides } from "./viewport-state"
 
 export let debuggerAttached = new Set<number>()
 export let infoBannerHeight = 0
@@ -23,7 +24,7 @@ export async function cdpCommand(
     const result = await chrome.debugger.sendCommand(target, method, params)
     return result
   } finally {
-    if (!isAttached) {
+    if (!isAttached && !viewportOverrides.has(tabId)) {
       try {
         await chrome.debugger.detach(target)
         debuggerAttached.delete(tabId)
@@ -148,6 +149,7 @@ export function registerCdpListeners(): void {
   chrome.debugger.onDetach.addListener((source, reason) => {
     if (source.tabId) {
       debuggerAttached.delete(source.tabId)
+      clearViewportState(source.tabId)
       fetchInterceptionEnabled.delete(source.tabId)
       networkCaptureConfigs.delete(source.tabId)
       networkOverrideConfigs.delete(source.tabId)

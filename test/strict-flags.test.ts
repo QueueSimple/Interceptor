@@ -132,6 +132,7 @@ const MODULE_COMMANDS: Record<string, string[]> = {
   "actions.ts": ["click", "type", "select", "focus", "blur", "hover", "drag", "dblclick", "rightclick", "check", "keys", "click-at", "what-at", "regions"],
   "navigation.ts": ["navigate", "back", "forward", "scroll", "wait", "wait-stable", "wait_for"],
   "tabs.ts": ["tabs", "tab", "window", "frames", "session"],
+  "viewport.ts": ["viewport"],
   "network.ts": ["network", "net", "headers"],
   "screenshot.ts": ["screenshot", "canvas", "capture", "ocr"],
   "data.ts": ["cookies", "storage", "history", "bookmarks", "downloads", "clear", "clipboard"],
