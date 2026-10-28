@@ -2121,7 +2121,10 @@ async function handleTabActions(action, tabId) {
       return { success: true };
     }
     case "tab_switch": {
-      await chrome.tabs.update(action.tabId, { active: true });
+      if (action.active === true)
+        await chrome.tabs.update(action.tabId, { active: true });
+      else
+        await chrome.tabs.get(action.tabId);
       return { success: true };
     }
     case "tab_list": {

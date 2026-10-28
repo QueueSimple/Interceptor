@@ -21,6 +21,7 @@ describe("tab close/switch id parsing", () => {
 
   test("switch takes the first non-flag id", async () => {
     expect(await parseTabsCommand(["tab", "switch", "456", "--json"])).toEqual({ type: "tab_switch", tabId: 456 })
+    expect(await parseTabsCommand(["tab", "switch", "456", "--activate"])).toEqual({ type: "tab_switch", tabId: 456, active: true })
   })
 
   test("non-numeric ids are a hard error, not a partial parse", async () => {

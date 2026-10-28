@@ -221,8 +221,10 @@ export async function handleTabActions(
       // No auto-target write here: the dispatcher's post-gate persist already
       // stored the switch target under the caller's (per-group or global) key;
       // a handler-side global write would clobber the ungrouped key on
-      // grouped switches.
-      await chrome.tabs.update(action.tabId as number, { active: true })
+      // grouped switches. Background-first: the switch only retargets unless
+      // the caller passed --activate, so the user's visible tab stays put.
+      if (action.active === true) await chrome.tabs.update(action.tabId as number, { active: true })
+      else await chrome.tabs.get(action.tabId as number)
       return { success: true }
     }
 

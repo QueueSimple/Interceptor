@@ -166,7 +166,11 @@ export async function parseTabsCommand(filtered: string[]): Promise<Action | nul
             console.error(`error: tab switch requires a numeric tab ID${switchId !== undefined ? `, got '${switchId}'` : ""}`)
             process.exit(1)
           }
-          return { type: "tab_switch", tabId: parseInt(switchId) }
+          // Retarget-only by default: routine agent switches swapped the
+          // user's visible tab every few seconds. --activate is the opt-in.
+          return filtered.includes("--activate")
+            ? { type: "tab_switch", tabId: parseInt(switchId), active: true }
+            : { type: "tab_switch", tabId: parseInt(switchId) }
         }
         case "sweep":
           // Close every tab in the default Interceptor group in one call.

@@ -289,7 +289,7 @@ Tabs:
   interceptor tab new [url] --activate       Open new tab and foreground it (explicit opt-in)
   interceptor tab new [url] --reuse          Navigate the group's most-recent tab instead of creating
   interceptor tab close [id]                 Close tab
-  interceptor tab switch <id>                Switch to tab (explicit focus move)
+  interceptor tab switch <id> [--activate]   Target a tab; --activate also shows it
   interceptor window new [url]               Open a new browser window
   interceptor window list                    List all browser windows
   interceptor window close <id>              Close a browser window
@@ -505,7 +505,7 @@ macOS Bridge (full install only):
   Background-first by contract (mirrors the browser surface in 'Tabs' and 'open' above):
   the only verbs that move the user's frontmost window or active tab are
   'macos app activate', 'macos open --activate', 'open --activate',
-  'tab new --activate', 'tab switch <id>', and 'window focus <id>'.
+  'tab new --activate', 'tab switch <id> --activate', and 'window focus <id>'.
   Every other 'macos *' verb and every routine 'open'/'tab new' leaves focus alone.
 
   Compound (agent-optimized):
