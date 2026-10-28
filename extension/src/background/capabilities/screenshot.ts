@@ -1,6 +1,7 @@
 import { sendToContentScript } from "../content-bridge"
 import { sendToOffscreen } from "../offscreen"
 import { installScreenshotCorsRule, uninstallScreenshotCorsRule } from "./screenshot-cors"
+import { activateInAgentWindow } from "./tabs"
 
 type ActionResult = { success: boolean; error?: string; data?: unknown; tabId?: number; fallbackEligible?: boolean }
 
@@ -35,39 +36,21 @@ function mimeTypeForFormat(format: string): string {
   return "image/jpeg"
 }
 
-// Background-first contract: chrome.tabs.captureVisibleTab captures the
-// **active** tab in a window, ignoring the tabId we pass — so when the target
-// tab was opened with `active: false` (the new default), the strip loop would
-// capture whichever foreground tab the user is actually looking at instead.
-// Mitigation: briefly activate our target around the capture window, then
-// restore whichever tab was active when we started. The visible flash is the
-// price; silently capturing the user's foreground tab is the bug we cannot
-// ship. Caller is expected to wrap the entire captureVisibleTab block —
-// including the rate-limit gap between strips — so the prior-active tab is
-// only restored once the full sequence is done.
+// captureVisibleTab captures the active tab of the supplied window. Move the
+// target and its whole group into the unfocused agent window before activating
+// it, then give the caller that window's id. Leave the group there afterward;
+// activating or restoring tabs in the user's window can steal OS focus.
 export async function withCaptureVisibleTabFocus<T>(
   tabId: number,
-  windowId: number,
-  fn: () => Promise<T>
+  fn: (windowId: number) => Promise<T>
 ): Promise<T> {
-  const [priorActive] = await chrome.tabs.query({ active: true, windowId })
-  const targetAlreadyActive = priorActive?.id === tabId
-  if (!targetAlreadyActive) {
-    try {
-      await chrome.tabs.update(tabId, { active: true })
-    } catch {
-      // If activation fails (tab vanished, window state changed), let the
-      // caller's captureVisibleTab call surface the underlying error so the
-      // existing diagnostics path stays authoritative.
-    }
-  }
-  try {
-    return await fn()
-  } finally {
-    if (!targetAlreadyActive && typeof priorActive?.id === "number" && priorActive.id !== tabId) {
-      await chrome.tabs.update(priorActive.id, { active: true }).catch(() => undefined)
-    }
-  }
+  // Already the active tab of its window: it is on screen, so capture in place
+  // rather than pulling the tab the user may be looking at out of their window.
+  const current = await chrome.tabs.get(tabId)
+  if (current.active) return fn(current.windowId)
+  const tab = await activateInAgentWindow(tabId)
+  if (!tab) throw new Error(`tab ${tabId} not found after agent-window activation`)
+  return fn(tab.windowId)
 }
 
 async function stitchStripsInWorker(
@@ -180,8 +163,7 @@ async function handleDomRenderScreenshot(
 
   // Preflight: a minimized window has no live compositor frame to render, so
   // the content-script render would hang until the CLI WebSocket client times
-  // out (cli/transport.ts). Match the --pixel path's fast, honest failure
-  // instead.
+  // out (cli/transport.ts). Fail promptly instead.
   const renderWindow = await chrome.windows.get(targetTab.windowId, { populate: false }).catch(() => null)
   if (renderWindow && renderWindow.state === "minimized") {
     return {
@@ -327,6 +309,28 @@ async function handlePixelScreenshot(
   action: { type: string; [key: string]: unknown },
   tabId: number
 ): Promise<ActionResult> {
+  try {
+    return await withCaptureVisibleTabFocus(tabId, async (windowId) => {
+      const captureWindow = await chrome.windows.get(windowId, { populate: false })
+      if (captureWindow.state === "minimized") {
+        return {
+          success: false,
+          error: `agent window ${windowId} is minimized — captureVisibleTab cannot capture minimized windows`,
+          data: { hint: VISIBILITY_HINT, layer: "preflight", windowState: captureWindow.state }
+        }
+      }
+      return handlePixelScreenshotInAgentWindow(action, tabId, windowId)
+    })
+  } catch (err) {
+    return { success: false, error: `pixel screenshot failed: ${(err as Error).message}` }
+  }
+}
+
+async function handlePixelScreenshotInAgentWindow(
+  action: { type: string; [key: string]: unknown },
+  tabId: number,
+  windowId: number
+): Promise<ActionResult> {
   // Output format requested by caller. WebP is supported via OffscreenCanvas
   // re-encode (chrome.tabs.captureVisibleTab itself only emits PNG/JPEG).
   const requestedFormat = (action.format as string) === "webp" ? "webp"
@@ -350,22 +354,9 @@ async function handlePixelScreenshot(
     const stripCount = Math.ceil(scrollHeight / viewportHeight)
     const strips: { dataUrl: string; y: number }[] = []
 
-    const fullTab = await chrome.tabs.get(tabId).catch(() => null)
-    if (!fullTab) return { success: false, error: `tab ${tabId} not found`, data: { hint: VISIBILITY_HINT } }
-    const fullWindow = await chrome.windows.get(fullTab.windowId, { populate: false }).catch(() => null)
-    if (fullWindow && fullWindow.state === "minimized") {
-      return {
-        success: false,
-        error: `window ${fullTab.windowId} is minimized — captureVisibleTab cannot capture minimized windows`,
-        data: { hint: VISIBILITY_HINT, layer: "preflight", windowState: fullWindow.state }
-      }
-    }
-
-    // captureVisibleTab targets the active tab in the window. Wrap the entire
-    // strip sequence in one focus borrow so we only flash once for a full-page
-    // capture — not once per strip — and the user's prior-active tab is
-    // restored after the final strip lands.
-    const stripCaptureOutcome = await withCaptureVisibleTabFocus(tabId, fullTab.windowId, async () => {
+    // The target is already active in the agent window. Measure and capture
+    // every strip there so dimensions reflect the destination viewport.
+    const stripCaptureOutcome = await (async () => {
       for (let i = 0; i < stripCount; i++) {
         const scrollTo = i * viewportHeight
         await sendToContentScript(tabId, { type: "scroll_absolute", y: scrollTo })
@@ -374,7 +365,7 @@ async function handlePixelScreenshot(
         try {
           stripUrl = await withCaptureTimeout(
             `captureVisibleTab(strip ${i + 1}/${stripCount})`,
-            chrome.tabs.captureVisibleTab(fullTab.windowId, { format: captureFormat, quality })
+            chrome.tabs.captureVisibleTab(windowId, { format: captureFormat, quality })
           )
         } catch (err) {
           await sendToContentScript(tabId, { type: "scroll_absolute", y: origScrollY }).catch(() => undefined)
@@ -400,7 +391,7 @@ async function handlePixelScreenshot(
       }
       await sendToContentScript(tabId, { type: "scroll_absolute", y: origScrollY }).catch(() => undefined)
       return { ok: true as const }
-    })
+    })()
     if (!stripCaptureOutcome.ok) return stripCaptureOutcome.error
 
     // Stitch inline in the SW using OffscreenCanvas — avoids the
@@ -439,28 +430,11 @@ async function handlePixelScreenshot(
     return { success: true, data: { dataUrl: stitchedUrl, format: requestedFormat, size: stitchedSize, strips: stripCount } }
   }
 
-  const targetTab = await chrome.tabs.get(tabId).catch(() => null)
-  if (!targetTab) {
-    return { success: false, error: `tab ${tabId} not found`, data: { hint: VISIBILITY_HINT } }
-  }
-  const targetWindow = await chrome.windows.get(targetTab.windowId, { populate: false }).catch(() => null)
-  if (targetWindow && targetWindow.state === "minimized") {
-    return {
-      success: false,
-      error: `window ${targetTab.windowId} is minimized — captureVisibleTab cannot capture minimized windows`,
-      data: { hint: VISIBILITY_HINT, layer: "preflight", windowState: targetWindow.state }
-    }
-  }
-
   let dataUrl: string
   try {
-    // Same borrow-and-restore as the strip path. One brief flash for a single
-    // capture is the cost of background-first defaults.
-    dataUrl = await withCaptureVisibleTabFocus(tabId, targetTab.windowId, () =>
-      withCaptureTimeout(
-        "captureVisibleTab",
-        chrome.tabs.captureVisibleTab(targetTab.windowId, { format: captureFormat, quality })
-      )
+    dataUrl = await withCaptureTimeout(
+      "captureVisibleTab",
+      chrome.tabs.captureVisibleTab(windowId, { format: captureFormat, quality })
     )
   } catch (err) {
     if (err instanceof CaptureTimeoutError) {
@@ -618,9 +592,9 @@ async function handleOcr(
 // The pixel path is a DIFFERENT capture mechanism that can only honor a subset
 // of the request, so the fallback is gated tightly:
 //  - Never when the caller set `no_fallback` (`--no-fallback`). The pixel
-//    full-page path borrows tab focus (captureVisibleTab needs the tab active)
-//    and scrolls the page strip-by-strip — both restored, but callers
-//    mid-interaction can refuse those side effects outright.
+//    full-page path moves the tab's group into the unfocused agent window and
+//    scrolls the page strip-by-strip (scroll restored). Callers mid-interaction
+//    can refuse those side effects outright.
 //  - Only on a genuine render failure (domResult.fallbackEligible) — not on
 //    tab-not-found / restricted-page / timeout errors, which a pixel retry
 //    can't fix and would only mask behind extra latency.
@@ -665,7 +639,7 @@ export function planPixelFallback(
 
   // The note travels in the result data — it must disclose the fallback's
   // side effects, not just that it happened. Suppressible via --no-fallback.
-  const sideEffects = "borrowed tab focus + scrolled page (both restored; --no-fallback to forbid)"
+  const sideEffects = "tab group stays in unfocused agent window + scrolled page (scroll restored; --no-fallback to forbid)"
   const note = droppedOpts.length
     ? `dom-render (${domResult.error}) → pixel [dropped: ${droppedOpts.join(", ")}] — ${sideEffects}`
     : `dom-render (${domResult.error}) → pixel — ${sideEffects}`

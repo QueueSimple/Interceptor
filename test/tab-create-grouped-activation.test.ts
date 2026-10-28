@@ -20,6 +20,7 @@ function installChromeMock() {
     windows: {
       getAll: async () => [{ id: 9, focused: true, type: "normal" }],
       get: async () => ({ id: 9, type: "normal" }),
+      create: async () => ({ id: 10, type: "normal" }),
     },
     tabs: {
       create: async () => {
@@ -35,6 +36,7 @@ function installChromeMock() {
       update,
     },
     tabGroups: {
+      move: async () => { calls.push("group-move") },
       get: async () => { throw new Error("no existing group") },
       query: async () => [],
       update: async () => {
@@ -65,6 +67,7 @@ describe("tab_create grouped activation", () => {
     expect(update).toHaveBeenCalledWith(77, { active: true })
     expect(calls.indexOf("group")).toBeGreaterThan(-1)
     expect(calls.indexOf("activate:77:true")).toBeGreaterThan(calls.indexOf("group"))
+    expect(calls.indexOf("activate:77:true")).toBeGreaterThan(calls.indexOf("group-move"))
   })
 
   test("background creation never performs a post-group activation", async () => {

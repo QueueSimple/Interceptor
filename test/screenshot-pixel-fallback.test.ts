@@ -13,23 +13,23 @@ const RENDER_FAIL = { success: false, error: "dom render failed: image load fail
 
 describe("planPixelFallback", () => {
   test("no_fallback forbids the fallback entirely (side-effect escape hatch)", () => {
-    // --no-fallback: the caller refuses the pixel path's focus-borrow + scroll
+    // --no-fallback: the caller refuses the pixel path's group move + scroll
     // side effects and takes the DOM-render error instead.
     expect(planPixelFallback({ type: "screenshot", no_fallback: true }, RENDER_FAIL)).toBeNull()
   })
 
   test("the note discloses the fallback's side effects and the escape hatch", () => {
-    // The pixel full-page path borrows tab focus and scrolls the page. The
+    // The pixel full-page path moves the group and scrolls the page. The
     // caller never asked for the pixel path, so the result must say so.
     const plan = planPixelFallback({ type: "screenshot" }, RENDER_FAIL)
-    expect(plan!.note).toContain("borrowed tab focus")
+    expect(plan!.note).toContain("tab group stays in unfocused agent window")
     expect(plan!.note).toContain("scrolled page")
     expect(plan!.note).toContain("restored")
     expect(plan!.note).toContain("--no-fallback")
     // Disclosure also present when options were dropped.
     const dropped = planPixelFallback({ type: "screenshot", scale: 2 }, RENDER_FAIL)
     expect(dropped!.note).toContain("dropped: --scale")
-    expect(dropped!.note).toContain("borrowed tab focus")
+    expect(dropped!.note).toContain("tab group stays in unfocused agent window")
   })
 
   test("#4: only falls back on a genuine render failure (fallbackEligible)", () => {

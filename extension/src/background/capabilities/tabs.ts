@@ -23,30 +23,50 @@ function sessionArea(): chrome.storage.StorageArea {
 // The agent window: a normal window created unfocused that holds tabs an agent
 // asked to foreground. Activating a tab inside it never raises it, while
 // activating a tab in the user's own window steals OS focus (KDE Wayland,
-// 2026-10-27). Created once, remembered in session storage.
+// 2026-10-27). Created once and remembered in local storage, which survives an
+// extension reload (session storage does not, so every reload opened another
+// agent window). Window ids restart with the browser, so the key is dropped on
+// browser startup: a stale id must never adopt the user's window.
 const AGENT_WINDOW_KEY = "agentWindowId"
 
-async function ensureAgentWindow(): Promise<number | undefined> {
+// Falls back to the session area where local storage is absent (test mocks).
+function agentWindowArea(): chrome.storage.StorageArea {
+  return chrome.storage.local ?? sessionArea()
+}
+
+globalThis.chrome?.runtime?.onStartup?.addListener(() => {
+  void agentWindowArea().remove(AGENT_WINDOW_KEY)
+})
+
+export async function ensureAgentWindow(): Promise<number | undefined> {
   if (!chrome.windows || typeof chrome.windows.create !== "function") return undefined
-  const stored = (await sessionArea().get(AGENT_WINDOW_KEY))[AGENT_WINDOW_KEY] as number | undefined
+  const stored = (await agentWindowArea().get(AGENT_WINDOW_KEY))[AGENT_WINDOW_KEY] as number | undefined
   if (typeof stored === "number") {
     const win = await chrome.windows.get(stored).catch(() => undefined)
     if (win?.id !== undefined && win.type === "normal") return win.id
   }
   const created = await chrome.windows.create({ url: "about:blank", focused: false })
   if (created?.id === undefined) return undefined
-  await sessionArea().set({ [AGENT_WINDOW_KEY]: created.id })
+  await agentWindowArea().set({ [AGENT_WINDOW_KEY]: created.id })
   return created.id
 }
 
 // Foreground a tab without touching the user's window: move it (with its whole
 // group, so group membership survives) into the agent window, then activate it
 // there.
-async function activateInAgentWindow(tabId: number): Promise<chrome.tabs.Tab | undefined> {
+export async function activateInAgentWindow(tabId: number): Promise<chrome.tabs.Tab | undefined> {
   const tab = await chrome.tabs.get(tabId)
+  // MV2/Electron has no windows API and no separate user window to protect:
+  // activate in place there. With the API present, never fall back to
+  // activating inside the user's window.
+  if (!chrome.windows || typeof chrome.windows.create !== "function") {
+    return chrome.tabs.update(tabId, { active: true })
+  }
   const agentWin = await ensureAgentWindow()
-  if (agentWin !== undefined && tab.windowId !== agentWin) {
-    if (tab.groupId !== undefined && tab.groupId >= 0 && chrome.tabGroups?.move) {
+  if (agentWin === undefined) throw new Error("agent window unavailable — cannot activate tab safely")
+  if (tab.windowId !== agentWin) {
+    if (tab.groupId !== undefined && tab.groupId >= 0) {
+      if (!chrome.tabGroups?.move) throw new Error("cannot move tab group into the agent window")
       await chrome.tabGroups.move(tab.groupId, { windowId: agentWin, index: -1 })
     } else {
       await chrome.tabs.move(tabId, { windowId: agentWin, index: -1 })

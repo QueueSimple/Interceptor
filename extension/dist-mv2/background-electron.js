@@ -839,6 +839,333 @@ async function uninstallScreenshotCorsRule(tabId) {
   } catch {}
 }
 
+// extension/src/background/tab-lifecycle.ts
+var DEFAULT_TAB_LIFECYCLE = { reuse: true, idleCloseMinutes: 10 };
+var STORAGE_KEY = "tabLifecycle";
+var GROUP_LAST_SEEN_PREFIX = "groupLastSeen:";
+function normalizeTabLifecycle(raw) {
+  const obj = raw && typeof raw === "object" ? raw : {};
+  const reuse = typeof obj.reuse === "boolean" ? obj.reuse : DEFAULT_TAB_LIFECYCLE.reuse;
+  let idle = DEFAULT_TAB_LIFECYCLE.idleCloseMinutes;
+  if (typeof obj.idleCloseMinutes === "number" && Number.isFinite(obj.idleCloseMinutes)) {
+    idle = Math.max(0, Math.round(obj.idleCloseMinutes));
+  }
+  return { reuse, idleCloseMinutes: idle };
+}
+function policyMayDecideReuse(action) {
+  return action.reuse === undefined && action.reusePolicy === true && typeof action.group === "string" && action.group.length > 0;
+}
+async function readArea(area) {
+  try {
+    const storageArea = chrome.storage[area];
+    if (!storageArea || typeof storageArea.get !== "function")
+      return;
+    const stored = await storageArea.get(STORAGE_KEY);
+    const raw = stored?.[STORAGE_KEY];
+    if (raw === undefined || raw === null)
+      return;
+    return normalizeTabLifecycle(raw);
+  } catch {
+    return;
+  }
+}
+async function resolveTabLifecycle() {
+  const managed = await readArea("managed");
+  if (managed)
+    return { policy: managed, source: "managed" };
+  const local = await readArea("local");
+  if (local)
+    return { policy: local, source: "local" };
+  return { policy: { ...DEFAULT_TAB_LIFECYCLE }, source: "default" };
+}
+function sessionArea3() {
+  const storage = chrome.storage;
+  return storage.session ?? chrome.storage.local;
+}
+function stampKey(label) {
+  return `${GROUP_LAST_SEEN_PREFIX}${label}`;
+}
+function recordGroupActivity(label) {
+  try {
+    sessionArea3().set({ [stampKey(label ?? "")]: Date.now() }).catch(() => {});
+  } catch {}
+}
+
+// extension/src/background/capabilities/tabs.ts
+function activeTabKey(group) {
+  return group ? `activeTabId:${group}` : "activeTabId";
+}
+function sessionArea4() {
+  const storage = chrome.storage;
+  return storage.session ?? chrome.storage.local;
+}
+var AGENT_WINDOW_KEY = "agentWindowId";
+function agentWindowArea() {
+  return chrome.storage.local ?? sessionArea4();
+}
+globalThis.chrome?.runtime?.onStartup?.addListener(() => {
+  agentWindowArea().remove(AGENT_WINDOW_KEY);
+});
+async function ensureAgentWindow() {
+  if (!chrome.windows || typeof chrome.windows.create !== "function")
+    return;
+  const stored = (await agentWindowArea().get(AGENT_WINDOW_KEY))[AGENT_WINDOW_KEY];
+  if (typeof stored === "number") {
+    const win = await chrome.windows.get(stored).catch(() => {
+      return;
+    });
+    if (win?.id !== undefined && win.type === "normal")
+      return win.id;
+  }
+  const created = await chrome.windows.create({ url: "about:blank", focused: false });
+  if (created?.id === undefined)
+    return;
+  await agentWindowArea().set({ [AGENT_WINDOW_KEY]: created.id });
+  return created.id;
+}
+async function activateInAgentWindow(tabId) {
+  const tab = await chrome.tabs.get(tabId);
+  if (!chrome.windows || typeof chrome.windows.create !== "function") {
+    return chrome.tabs.update(tabId, { active: true });
+  }
+  const agentWin = await ensureAgentWindow();
+  if (agentWin === undefined)
+    throw new Error("agent window unavailable — cannot activate tab safely");
+  if (tab.windowId !== agentWin) {
+    if (tab.groupId !== undefined && tab.groupId >= 0) {
+      if (!chrome.tabGroups?.move)
+        throw new Error("cannot move tab group into the agent window");
+      await chrome.tabGroups.move(tab.groupId, { windowId: agentWin, index: -1 });
+    } else {
+      await chrome.tabs.move(tabId, { windowId: agentWin, index: -1 });
+    }
+  }
+  return chrome.tabs.update(tabId, { active: true });
+}
+function groupWarningFor(groupId, groupApiAvailable) {
+  if (groupId === -1 && groupApiAvailable) {
+    return "tab was not added to a tab group (non-normal window or transient group failure) — per-agent group isolation is not in effect for this tab";
+  }
+  return;
+}
+async function resolveNormalWindowPlacement(focusNew, url, group) {
+  if (!chrome.windows || typeof chrome.windows.getAll !== "function")
+    return {};
+  try {
+    const normal = await chrome.windows.getAll({ windowTypes: ["normal"] });
+    const home = await managedGroupWindows(group);
+    if (home.own !== undefined && normal.some((w) => w.id === home.own))
+      return { windowId: home.own };
+    const hosting = normal.filter((w) => w.id !== undefined && home.hosting.has(w.id)).sort((a, b) => (home.hosting.get(b.id) ?? 0) - (home.hosting.get(a.id) ?? 0));
+    const pool = hosting.length > 0 ? hosting : normal;
+    const existing = pool.find((w) => w.focused)?.id ?? pool[0]?.id;
+    if (existing !== undefined)
+      return { windowId: existing };
+    if (typeof chrome.windows.create === "function") {
+      const created = await chrome.windows.create({ url, focused: focusNew });
+      return { windowId: created?.id, createdTab: created?.tabs?.[0] };
+    }
+  } catch {}
+  return {};
+}
+async function handleTabActions(action, tabId) {
+  switch (action.type) {
+    case "tab_create": {
+      const targetUrl = action.url || "about:blank";
+      const group = typeof action.group === "string" && action.group.length > 0 ? action.group : undefined;
+      if (group && !GROUP_LABEL_RE.test(group)) {
+        return { success: false, error: `invalid group label '${group}' — must match [A-Za-z0-9_-]{1,32}` };
+      }
+      let reuseWanted = action.reuse === true;
+      if (!reuseWanted && policyMayDecideReuse(action)) {
+        try {
+          reuseWanted = (await resolveTabLifecycle()).policy.reuse;
+        } catch {
+          reuseWanted = false;
+        }
+      }
+      if (reuseWanted) {
+        const groupId = group ? await ensureNamedGroup(group) : await ensureInterceptorGroup();
+        if (groupId !== -1) {
+          const groupTabs = await chrome.tabs.query({ groupId });
+          if (groupTabs.length > 0) {
+            const sorted = groupTabs.filter((t) => typeof t.id === "number").sort((a, b) => b.id - a.id);
+            const candidate = sorted[0];
+            if (candidate?.id !== undefined) {
+              try {
+                const reuseActivate = action.active === true;
+                let updated = candidate;
+                if (action.prepareOnly === true) {
+                  updated = reuseActivate ? await activateInAgentWindow(candidate.id) : await chrome.tabs.get(candidate.id);
+                } else {
+                  const updateProps = { url: targetUrl };
+                  updated = await chrome.tabs.update(candidate.id, updateProps);
+                  await waitForTabLoad(candidate.id);
+                  if (reuseActivate)
+                    updated = await activateInAgentWindow(candidate.id);
+                }
+                await sessionArea4().set({ [activeTabKey(group)]: candidate.id });
+                return {
+                  success: true,
+                  data: { tabId: candidate.id, url: updated?.url ?? targetUrl, windowId: updated?.windowId ?? candidate.windowId, groupId, group, reused: true }
+                };
+              } catch {}
+            }
+          }
+        }
+      }
+      const shouldActivate = action.active === true;
+      const placement = await resolveNormalWindowPlacement(false, targetUrl, group);
+      const newTab = placement.createdTab ?? await chrome.tabs.create({
+        url: targetUrl,
+        active: false,
+        ...placement.windowId !== undefined ? { windowId: placement.windowId } : {}
+      });
+      if (newTab.id) {
+        const groupId = group ? await addTabToNamedGroup(newTab.id, group, action.groupColor) : await addTabToInterceptorGroup(newTab.id);
+        if (shouldActivate)
+          await activateInAgentWindow(newTab.id);
+        await sessionArea4().set({ [activeTabKey(group)]: newTab.id });
+        const data = { tabId: newTab.id, url: newTab.url, windowId: newTab.windowId, groupId, group, reused: false };
+        const groupWarning = groupWarningFor(groupId, hasTabGroupApi());
+        if (groupWarning)
+          data.groupWarning = groupWarning;
+        return { success: true, data };
+      }
+      return { success: true, data: { tabId: newTab.id, url: newTab.url, reused: false } };
+    }
+    case "tab_close": {
+      const closedId = action.tabId || tabId;
+      await chrome.tabs.remove(closedId);
+      const keys = ["activeTabId", typeof action.group === "string" ? activeTabKey(action.group) : null].filter((k) => !!k);
+      const stored = await sessionArea4().get(keys);
+      for (const key of keys) {
+        if (stored[key] === closedId)
+          await sessionArea4().remove(key);
+      }
+      return { success: true };
+    }
+    case "tab_switch": {
+      if (action.active === true)
+        await activateInAgentWindow(action.tabId);
+      else
+        await chrome.tabs.get(action.tabId);
+      return { success: true };
+    }
+    case "tab_list": {
+      const tabs = await chrome.tabs.query({});
+      await ensureInterceptorGroup();
+      await hydrateNamedGroups();
+      const namedIds = new Set(namedGroups.values());
+      const tabData = tabs.map((t) => ({
+        id: t.id,
+        url: t.url,
+        title: t.title,
+        active: t.active,
+        windowId: t.windowId,
+        muted: t.mutedInfo?.muted,
+        pinned: t.pinned,
+        groupId: t.groupId,
+        managed: interceptorGroupId !== null && t.groupId === interceptorGroupId || namedIds.has(t.groupId),
+        group: labelForGroupId(t.groupId)
+      }));
+      return { success: true, data: tabData };
+    }
+    case "group_list": {
+      if (!chrome.tabGroups || typeof chrome.tabGroups.query !== "function") {
+        return { success: true, data: [] };
+      }
+      await ensureInterceptorGroup();
+      await hydrateNamedGroups();
+      const live = await chrome.tabGroups.query({}).catch(() => []);
+      const prefix = `${groupTitleFor("")}`;
+      for (const g of live) {
+        if (typeof g.title !== "string" || !g.title.startsWith(prefix))
+          continue;
+        const label = g.title.slice(prefix.length);
+        if (GROUP_LABEL_RE.test(label) && labelForGroupId(g.id) === null && g.id !== interceptorGroupId) {
+          await ensureNamedGroup(label);
+        }
+      }
+      const data = await Promise.all(live.map(async (g) => {
+        const groupTabs = await chrome.tabs.query({ groupId: g.id });
+        return {
+          groupId: g.id,
+          title: g.title,
+          color: g.color,
+          tabCount: groupTabs.length,
+          label: labelForGroupId(g.id),
+          default: interceptorGroupId !== null && g.id === interceptorGroupId,
+          managed: interceptorGroupId !== null && g.id === interceptorGroupId || labelForGroupId(g.id) !== null
+        };
+      }));
+      return { success: true, data };
+    }
+    case "group_close": {
+      const label = action.label;
+      if (!label || !GROUP_LABEL_RE.test(label)) {
+        return { success: false, error: `group_close requires a valid label (got '${label ?? ""}')` };
+      }
+      const groupId = await ensureNamedGroup(label);
+      if (groupId === -1) {
+        return { success: false, error: `group '${label}' not found` };
+      }
+      const groupTabs = await chrome.tabs.query({ groupId });
+      const ids = groupTabs.map((t) => t.id).filter((id) => typeof id === "number");
+      if (ids.length > 0)
+        await chrome.tabs.remove(ids);
+      return { success: true, data: { label, groupId, closedTabs: ids.length } };
+    }
+    case "tab_duplicate": {
+      const dup = await chrome.tabs.duplicate(tabId);
+      return { success: true, data: { tabId: dup?.id } };
+    }
+    case "tab_reload":
+      await chrome.tabs.reload(tabId, { bypassCache: !!action.bypassCache });
+      await waitForTabLoad(tabId);
+      return { success: true };
+    case "tab_mute":
+      await chrome.tabs.update(tabId, { muted: !!(action.muted ?? true) });
+      return { success: true };
+    case "tab_pin":
+      await chrome.tabs.update(tabId, { pinned: !!(action.pinned ?? true) });
+      return { success: true };
+    case "tab_zoom_get": {
+      const zoom = await chrome.tabs.getZoom(tabId);
+      return { success: true, data: { zoom } };
+    }
+    case "tab_zoom_set":
+      await chrome.tabs.setZoom(tabId, action.zoom);
+      return { success: true };
+    case "tab_group": {
+      const groupId = await chrome.tabs.group({
+        tabIds: tabId,
+        groupId: action.groupId
+      });
+      if (action.title || action.color) {
+        await chrome.tabGroups.update(groupId, {
+          title: action.title,
+          color: action.color
+        });
+      }
+      return { success: true, data: { groupId } };
+    }
+    case "tab_ungroup":
+      await chrome.tabs.ungroup(tabId);
+      return { success: true };
+    case "tab_move":
+      await chrome.tabs.move(tabId, {
+        windowId: action.windowId,
+        index: action.index ?? -1
+      });
+      return { success: true };
+    case "tab_discard":
+      await chrome.tabs.discard(tabId);
+      return { success: true };
+  }
+  return { success: false, error: `unknown tab action: ${action.type}` };
+}
+
 // extension/src/background/capabilities/screenshot.ts
 var CAPTURE_TIMEOUT_MS = 5000;
 var DOM_RENDER_TIMEOUT_MS = 30000;
@@ -873,23 +1200,14 @@ function mimeTypeForFormat(format) {
     return "image/png";
   return "image/jpeg";
 }
-async function withCaptureVisibleTabFocus(tabId, windowId, fn) {
-  const [priorActive] = await chrome.tabs.query({ active: true, windowId });
-  const targetAlreadyActive = priorActive?.id === tabId;
-  if (!targetAlreadyActive) {
-    try {
-      await chrome.tabs.update(tabId, { active: true });
-    } catch {}
-  }
-  try {
-    return await fn();
-  } finally {
-    if (!targetAlreadyActive && typeof priorActive?.id === "number" && priorActive.id !== tabId) {
-      await chrome.tabs.update(priorActive.id, { active: true }).catch(() => {
-        return;
-      });
-    }
-  }
+async function withCaptureVisibleTabFocus(tabId, fn) {
+  const current = await chrome.tabs.get(tabId);
+  if (current.active)
+    return fn(current.windowId);
+  const tab = await activateInAgentWindow(tabId);
+  if (!tab)
+    throw new Error(`tab ${tabId} not found after agent-window activation`);
+  return fn(tab.windowId);
 }
 async function stitchStripsInWorker(strips, totalWidth, totalHeight, format, quality, scale = 1) {
   try {
@@ -1073,6 +1391,23 @@ async function handleScreenshotBackground(action, tabId) {
   }
 }
 async function handlePixelScreenshot(action, tabId) {
+  try {
+    return await withCaptureVisibleTabFocus(tabId, async (windowId) => {
+      const captureWindow = await chrome.windows.get(windowId, { populate: false });
+      if (captureWindow.state === "minimized") {
+        return {
+          success: false,
+          error: `agent window ${windowId} is minimized — captureVisibleTab cannot capture minimized windows`,
+          data: { hint: VISIBILITY_HINT, layer: "preflight", windowState: captureWindow.state }
+        };
+      }
+      return handlePixelScreenshotInAgentWindow(action, tabId, windowId);
+    });
+  } catch (err) {
+    return { success: false, error: `pixel screenshot failed: ${err.message}` };
+  }
+}
+async function handlePixelScreenshotInAgentWindow(action, tabId, windowId) {
   const requestedFormat = action.format === "webp" ? "webp" : action.format === "png" ? "png" : "jpeg";
   const captureFormat = requestedFormat === "webp" ? "png" : requestedFormat;
   const quality = action.quality || 50;
@@ -1084,25 +1419,14 @@ async function handlePixelScreenshot(action, tabId) {
     const { scrollHeight, viewportHeight, viewportWidth, scrollY: origScrollY, devicePixelRatio } = dims.data;
     const stripCount = Math.ceil(scrollHeight / viewportHeight);
     const strips = [];
-    const fullTab = await chrome.tabs.get(tabId).catch(() => null);
-    if (!fullTab)
-      return { success: false, error: `tab ${tabId} not found`, data: { hint: VISIBILITY_HINT } };
-    const fullWindow = await chrome.windows.get(fullTab.windowId, { populate: false }).catch(() => null);
-    if (fullWindow && fullWindow.state === "minimized") {
-      return {
-        success: false,
-        error: `window ${fullTab.windowId} is minimized — captureVisibleTab cannot capture minimized windows`,
-        data: { hint: VISIBILITY_HINT, layer: "preflight", windowState: fullWindow.state }
-      };
-    }
-    const stripCaptureOutcome = await withCaptureVisibleTabFocus(tabId, fullTab.windowId, async () => {
+    const stripCaptureOutcome = await (async () => {
       for (let i = 0;i < stripCount; i++) {
         const scrollTo = i * viewportHeight;
         await sendToContentScript(tabId, { type: "scroll_absolute", y: scrollTo });
         await new Promise((r) => setTimeout(r, 150));
         let stripUrl;
         try {
-          stripUrl = await withCaptureTimeout(`captureVisibleTab(strip ${i + 1}/${stripCount})`, chrome.tabs.captureVisibleTab(fullTab.windowId, { format: captureFormat, quality }));
+          stripUrl = await withCaptureTimeout(`captureVisibleTab(strip ${i + 1}/${stripCount})`, chrome.tabs.captureVisibleTab(windowId, { format: captureFormat, quality }));
         } catch (err) {
           await sendToContentScript(tabId, { type: "scroll_absolute", y: origScrollY }).catch(() => {
             return;
@@ -1130,7 +1454,7 @@ async function handlePixelScreenshot(action, tabId) {
         return;
       });
       return { ok: true };
-    });
+    })();
     if (!stripCaptureOutcome.ok)
       return stripCaptureOutcome.error;
     const naturalWidth = Math.round(viewportWidth * devicePixelRatio);
@@ -1151,21 +1475,9 @@ async function handlePixelScreenshot(action, tabId) {
     }
     return { success: true, data: { dataUrl: stitchedUrl, format: requestedFormat, size: stitchedSize, strips: stripCount } };
   }
-  const targetTab = await chrome.tabs.get(tabId).catch(() => null);
-  if (!targetTab) {
-    return { success: false, error: `tab ${tabId} not found`, data: { hint: VISIBILITY_HINT } };
-  }
-  const targetWindow = await chrome.windows.get(targetTab.windowId, { populate: false }).catch(() => null);
-  if (targetWindow && targetWindow.state === "minimized") {
-    return {
-      success: false,
-      error: `window ${targetTab.windowId} is minimized — captureVisibleTab cannot capture minimized windows`,
-      data: { hint: VISIBILITY_HINT, layer: "preflight", windowState: targetWindow.state }
-    };
-  }
   let dataUrl;
   try {
-    dataUrl = await withCaptureVisibleTabFocus(tabId, targetTab.windowId, () => withCaptureTimeout("captureVisibleTab", chrome.tabs.captureVisibleTab(targetTab.windowId, { format: captureFormat, quality })));
+    dataUrl = await withCaptureTimeout("captureVisibleTab", chrome.tabs.captureVisibleTab(windowId, { format: captureFormat, quality }));
   } catch (err) {
     if (err instanceof CaptureTimeoutError) {
       return {
@@ -1302,7 +1614,7 @@ function planPixelFallback(action, domResult) {
     pixelAction.target_max_long_edge = action.target_max_long_edge;
   if (action.save !== undefined)
     pixelAction.save = action.save;
-  const sideEffects = "borrowed tab focus + scrolled page (both restored; --no-fallback to forbid)";
+  const sideEffects = "tab group stays in unfocused agent window + scrolled page (scroll restored; --no-fallback to forbid)";
   const note = droppedOpts.length ? `dom-render (${domResult.error}) → pixel [dropped: ${droppedOpts.join(", ")}] — ${sideEffects}` : `dom-render (${domResult.error}) → pixel — ${sideEffects}`;
   return { pixelAction, note };
 }
@@ -1955,320 +2267,6 @@ async function handleCanvasActions(action, tabId) {
     }
   }
   return { success: false, error: `unknown canvas action: ${action.type}` };
-}
-
-// extension/src/background/tab-lifecycle.ts
-var DEFAULT_TAB_LIFECYCLE = { reuse: true, idleCloseMinutes: 10 };
-var STORAGE_KEY = "tabLifecycle";
-var GROUP_LAST_SEEN_PREFIX = "groupLastSeen:";
-function normalizeTabLifecycle(raw) {
-  const obj = raw && typeof raw === "object" ? raw : {};
-  const reuse = typeof obj.reuse === "boolean" ? obj.reuse : DEFAULT_TAB_LIFECYCLE.reuse;
-  let idle = DEFAULT_TAB_LIFECYCLE.idleCloseMinutes;
-  if (typeof obj.idleCloseMinutes === "number" && Number.isFinite(obj.idleCloseMinutes)) {
-    idle = Math.max(0, Math.round(obj.idleCloseMinutes));
-  }
-  return { reuse, idleCloseMinutes: idle };
-}
-function policyMayDecideReuse(action) {
-  return action.reuse === undefined && action.reusePolicy === true && typeof action.group === "string" && action.group.length > 0;
-}
-async function readArea(area) {
-  try {
-    const storageArea = chrome.storage[area];
-    if (!storageArea || typeof storageArea.get !== "function")
-      return;
-    const stored = await storageArea.get(STORAGE_KEY);
-    const raw = stored?.[STORAGE_KEY];
-    if (raw === undefined || raw === null)
-      return;
-    return normalizeTabLifecycle(raw);
-  } catch {
-    return;
-  }
-}
-async function resolveTabLifecycle() {
-  const managed = await readArea("managed");
-  if (managed)
-    return { policy: managed, source: "managed" };
-  const local = await readArea("local");
-  if (local)
-    return { policy: local, source: "local" };
-  return { policy: { ...DEFAULT_TAB_LIFECYCLE }, source: "default" };
-}
-function sessionArea3() {
-  const storage = chrome.storage;
-  return storage.session ?? chrome.storage.local;
-}
-function stampKey(label) {
-  return `${GROUP_LAST_SEEN_PREFIX}${label}`;
-}
-function recordGroupActivity(label) {
-  try {
-    sessionArea3().set({ [stampKey(label ?? "")]: Date.now() }).catch(() => {});
-  } catch {}
-}
-
-// extension/src/background/capabilities/tabs.ts
-function activeTabKey(group) {
-  return group ? `activeTabId:${group}` : "activeTabId";
-}
-function sessionArea4() {
-  const storage = chrome.storage;
-  return storage.session ?? chrome.storage.local;
-}
-var AGENT_WINDOW_KEY = "agentWindowId";
-async function ensureAgentWindow() {
-  if (!chrome.windows || typeof chrome.windows.create !== "function")
-    return;
-  const stored = (await sessionArea4().get(AGENT_WINDOW_KEY))[AGENT_WINDOW_KEY];
-  if (typeof stored === "number") {
-    const win = await chrome.windows.get(stored).catch(() => {
-      return;
-    });
-    if (win?.id !== undefined && win.type === "normal")
-      return win.id;
-  }
-  const created = await chrome.windows.create({ url: "about:blank", focused: false });
-  if (created?.id === undefined)
-    return;
-  await sessionArea4().set({ [AGENT_WINDOW_KEY]: created.id });
-  return created.id;
-}
-async function activateInAgentWindow(tabId) {
-  const tab = await chrome.tabs.get(tabId);
-  const agentWin = await ensureAgentWindow();
-  if (agentWin !== undefined && tab.windowId !== agentWin) {
-    if (tab.groupId !== undefined && tab.groupId >= 0 && chrome.tabGroups?.move) {
-      await chrome.tabGroups.move(tab.groupId, { windowId: agentWin, index: -1 });
-    } else {
-      await chrome.tabs.move(tabId, { windowId: agentWin, index: -1 });
-    }
-  }
-  return chrome.tabs.update(tabId, { active: true });
-}
-function groupWarningFor(groupId, groupApiAvailable) {
-  if (groupId === -1 && groupApiAvailable) {
-    return "tab was not added to a tab group (non-normal window or transient group failure) — per-agent group isolation is not in effect for this tab";
-  }
-  return;
-}
-async function resolveNormalWindowPlacement(focusNew, url, group) {
-  if (!chrome.windows || typeof chrome.windows.getAll !== "function")
-    return {};
-  try {
-    const normal = await chrome.windows.getAll({ windowTypes: ["normal"] });
-    const home = await managedGroupWindows(group);
-    if (home.own !== undefined && normal.some((w) => w.id === home.own))
-      return { windowId: home.own };
-    const hosting = normal.filter((w) => w.id !== undefined && home.hosting.has(w.id)).sort((a, b) => (home.hosting.get(b.id) ?? 0) - (home.hosting.get(a.id) ?? 0));
-    const pool = hosting.length > 0 ? hosting : normal;
-    const existing = pool.find((w) => w.focused)?.id ?? pool[0]?.id;
-    if (existing !== undefined)
-      return { windowId: existing };
-    if (typeof chrome.windows.create === "function") {
-      const created = await chrome.windows.create({ url, focused: focusNew });
-      return { windowId: created?.id, createdTab: created?.tabs?.[0] };
-    }
-  } catch {}
-  return {};
-}
-async function handleTabActions(action, tabId) {
-  switch (action.type) {
-    case "tab_create": {
-      const targetUrl = action.url || "about:blank";
-      const group = typeof action.group === "string" && action.group.length > 0 ? action.group : undefined;
-      if (group && !GROUP_LABEL_RE.test(group)) {
-        return { success: false, error: `invalid group label '${group}' — must match [A-Za-z0-9_-]{1,32}` };
-      }
-      let reuseWanted = action.reuse === true;
-      if (!reuseWanted && policyMayDecideReuse(action)) {
-        try {
-          reuseWanted = (await resolveTabLifecycle()).policy.reuse;
-        } catch {
-          reuseWanted = false;
-        }
-      }
-      if (reuseWanted) {
-        const groupId = group ? await ensureNamedGroup(group) : await ensureInterceptorGroup();
-        if (groupId !== -1) {
-          const groupTabs = await chrome.tabs.query({ groupId });
-          if (groupTabs.length > 0) {
-            const sorted = groupTabs.filter((t) => typeof t.id === "number").sort((a, b) => b.id - a.id);
-            const candidate = sorted[0];
-            if (candidate?.id !== undefined) {
-              try {
-                const reuseActivate = action.active === true;
-                let updated = candidate;
-                if (action.prepareOnly === true) {
-                  updated = reuseActivate ? await activateInAgentWindow(candidate.id) : await chrome.tabs.get(candidate.id);
-                } else {
-                  const updateProps = { url: targetUrl };
-                  updated = await chrome.tabs.update(candidate.id, updateProps);
-                  await waitForTabLoad(candidate.id);
-                  if (reuseActivate)
-                    updated = await activateInAgentWindow(candidate.id);
-                }
-                await sessionArea4().set({ [activeTabKey(group)]: candidate.id });
-                return {
-                  success: true,
-                  data: { tabId: candidate.id, url: updated?.url ?? targetUrl, windowId: updated?.windowId ?? candidate.windowId, groupId, group, reused: true }
-                };
-              } catch {}
-            }
-          }
-        }
-      }
-      const shouldActivate = action.active === true;
-      const placement = await resolveNormalWindowPlacement(false, targetUrl, group);
-      const newTab = placement.createdTab ?? await chrome.tabs.create({
-        url: targetUrl,
-        active: false,
-        ...placement.windowId !== undefined ? { windowId: placement.windowId } : {}
-      });
-      if (newTab.id) {
-        const groupId = group ? await addTabToNamedGroup(newTab.id, group, action.groupColor) : await addTabToInterceptorGroup(newTab.id);
-        if (shouldActivate)
-          await activateInAgentWindow(newTab.id);
-        await sessionArea4().set({ [activeTabKey(group)]: newTab.id });
-        const data = { tabId: newTab.id, url: newTab.url, windowId: newTab.windowId, groupId, group, reused: false };
-        const groupWarning = groupWarningFor(groupId, hasTabGroupApi());
-        if (groupWarning)
-          data.groupWarning = groupWarning;
-        return { success: true, data };
-      }
-      return { success: true, data: { tabId: newTab.id, url: newTab.url, reused: false } };
-    }
-    case "tab_close": {
-      const closedId = action.tabId || tabId;
-      await chrome.tabs.remove(closedId);
-      const keys = ["activeTabId", typeof action.group === "string" ? activeTabKey(action.group) : null].filter((k) => !!k);
-      const stored = await sessionArea4().get(keys);
-      for (const key of keys) {
-        if (stored[key] === closedId)
-          await sessionArea4().remove(key);
-      }
-      return { success: true };
-    }
-    case "tab_switch": {
-      if (action.active === true)
-        await activateInAgentWindow(action.tabId);
-      else
-        await chrome.tabs.get(action.tabId);
-      return { success: true };
-    }
-    case "tab_list": {
-      const tabs = await chrome.tabs.query({});
-      await ensureInterceptorGroup();
-      await hydrateNamedGroups();
-      const namedIds = new Set(namedGroups.values());
-      const tabData = tabs.map((t) => ({
-        id: t.id,
-        url: t.url,
-        title: t.title,
-        active: t.active,
-        windowId: t.windowId,
-        muted: t.mutedInfo?.muted,
-        pinned: t.pinned,
-        groupId: t.groupId,
-        managed: interceptorGroupId !== null && t.groupId === interceptorGroupId || namedIds.has(t.groupId),
-        group: labelForGroupId(t.groupId)
-      }));
-      return { success: true, data: tabData };
-    }
-    case "group_list": {
-      if (!chrome.tabGroups || typeof chrome.tabGroups.query !== "function") {
-        return { success: true, data: [] };
-      }
-      await ensureInterceptorGroup();
-      await hydrateNamedGroups();
-      const live = await chrome.tabGroups.query({}).catch(() => []);
-      const prefix = `${groupTitleFor("")}`;
-      for (const g of live) {
-        if (typeof g.title !== "string" || !g.title.startsWith(prefix))
-          continue;
-        const label = g.title.slice(prefix.length);
-        if (GROUP_LABEL_RE.test(label) && labelForGroupId(g.id) === null && g.id !== interceptorGroupId) {
-          await ensureNamedGroup(label);
-        }
-      }
-      const data = await Promise.all(live.map(async (g) => {
-        const groupTabs = await chrome.tabs.query({ groupId: g.id });
-        return {
-          groupId: g.id,
-          title: g.title,
-          color: g.color,
-          tabCount: groupTabs.length,
-          label: labelForGroupId(g.id),
-          default: interceptorGroupId !== null && g.id === interceptorGroupId,
-          managed: interceptorGroupId !== null && g.id === interceptorGroupId || labelForGroupId(g.id) !== null
-        };
-      }));
-      return { success: true, data };
-    }
-    case "group_close": {
-      const label = action.label;
-      if (!label || !GROUP_LABEL_RE.test(label)) {
-        return { success: false, error: `group_close requires a valid label (got '${label ?? ""}')` };
-      }
-      const groupId = await ensureNamedGroup(label);
-      if (groupId === -1) {
-        return { success: false, error: `group '${label}' not found` };
-      }
-      const groupTabs = await chrome.tabs.query({ groupId });
-      const ids = groupTabs.map((t) => t.id).filter((id) => typeof id === "number");
-      if (ids.length > 0)
-        await chrome.tabs.remove(ids);
-      return { success: true, data: { label, groupId, closedTabs: ids.length } };
-    }
-    case "tab_duplicate": {
-      const dup = await chrome.tabs.duplicate(tabId);
-      return { success: true, data: { tabId: dup?.id } };
-    }
-    case "tab_reload":
-      await chrome.tabs.reload(tabId, { bypassCache: !!action.bypassCache });
-      await waitForTabLoad(tabId);
-      return { success: true };
-    case "tab_mute":
-      await chrome.tabs.update(tabId, { muted: !!(action.muted ?? true) });
-      return { success: true };
-    case "tab_pin":
-      await chrome.tabs.update(tabId, { pinned: !!(action.pinned ?? true) });
-      return { success: true };
-    case "tab_zoom_get": {
-      const zoom = await chrome.tabs.getZoom(tabId);
-      return { success: true, data: { zoom } };
-    }
-    case "tab_zoom_set":
-      await chrome.tabs.setZoom(tabId, action.zoom);
-      return { success: true };
-    case "tab_group": {
-      const groupId = await chrome.tabs.group({
-        tabIds: tabId,
-        groupId: action.groupId
-      });
-      if (action.title || action.color) {
-        await chrome.tabGroups.update(groupId, {
-          title: action.title,
-          color: action.color
-        });
-      }
-      return { success: true, data: { groupId } };
-    }
-    case "tab_ungroup":
-      await chrome.tabs.ungroup(tabId);
-      return { success: true };
-    case "tab_move":
-      await chrome.tabs.move(tabId, {
-        windowId: action.windowId,
-        index: action.index ?? -1
-      });
-      return { success: true };
-    case "tab_discard":
-      await chrome.tabs.discard(tabId);
-      return { success: true };
-  }
-  return { success: false, error: `unknown tab action: ${action.type}` };
 }
 
 // extension/src/background/capabilities/windows.ts
