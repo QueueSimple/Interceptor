@@ -81,11 +81,16 @@ describe("strict unknown-flag rejection (#212)", () => {
     for (const args of [
       ["tab", "close", "123", "--reuse"],
       ["tab", "close", "123", "--no-reuse"],
-      ["tab", "switch", "123", "--activate"],
+      ["tab", "switch", "123", "--reuse"],
     ]) {
       errors = []
       expect(() => normalizeArgs(args)).toThrow("is only valid with 'tab new'")
     }
+  })
+
+  test("tab switch accepts --activate", () => {
+    expect(normalizeArgs(["tab", "switch", "123", "--activate"]))
+      .toEqual(["tab", "switch", "123", "--activate"])
   })
 
   test("INTERCEPTOR_LAX_FLAGS=1 downgrades to a warning and keeps going", () => {

@@ -185,7 +185,12 @@ export async function parseTabsCommand(filtered: string[]): Promise<Action | nul
     case "window":
       switch (filtered[1]) {
         case "new":
-          return { type: "window_create", url: filtered[2], incognito: filtered.includes("--incognito") }
+          return {
+            type: "window_create",
+            url: filtered[2],
+            incognito: filtered.includes("--incognito"),
+            ...(filtered.includes("--background") ? { focused: false } : {})
+          }
         case "close":
           return { type: "window_close", windowId: parseWindowIdForCli(filtered[2]) }
         case "focus":

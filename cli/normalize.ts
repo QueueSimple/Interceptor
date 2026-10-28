@@ -135,7 +135,7 @@ const VALUE_FLAGS_BY_CMD: Record<string, string[]> = {
 const COMPOUND_BOOL = ["--activate", "--append", "--full", "--include-frames", "--include-style", "--markdown", "--net-only", "--no-read", "--no-reuse", "--no-wait", "--os", "--reuse", "--text-only", "--tree-only", "--trusted"]
 const STATE_BOOL = ["--elements-only", "--full", "--include-frames", "--markdown", "--native", "--text-only"]
 const ACTIONS_BOOL = ["--append", "--dropzone", "--picker", "--trusted", "--os", "--user"]
-const TABS_BOOL = ["--incognito"]
+const TABS_BOOL = ["--incognito", "--background"]
 const TAB_BOOL = ["--activate", "--no-reuse", "--reuse"]
 const NET_BOOL = ["--from-start", "--persist", "--reload", "--redact-auth"]
 const SCREENSHOT_BOOL = ["--background", "--full", "--image", "--no-fallback", "--pixel", "--save", "--webgl"]
@@ -261,7 +261,8 @@ export function normalizeArgsSplit(filtered: string[]): NormalizedArgs {
   }
 
   if (cmd === "tab" && positionals[0] !== "new") {
-    const unsupported = TAB_BOOL.find((flag) => flags.includes(flag))
+    const unsupported = TAB_BOOL.find((flag) =>
+      flags.includes(flag) && !(flag === "--activate" && positionals[0] === "switch"))
     if (unsupported) {
       throw new Error(`flag '${unsupported}' is only valid with 'tab new'.`)
     }

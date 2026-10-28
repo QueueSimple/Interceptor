@@ -20,6 +20,41 @@ function sessionArea(): chrome.storage.StorageArea {
   return storage.session ?? chrome.storage.local
 }
 
+// The agent window: a normal window created unfocused that holds tabs an agent
+// asked to foreground. Activating a tab inside it never raises it, while
+// activating a tab in the user's own window steals OS focus (KDE Wayland,
+// 2026-10-27). Created once, remembered in session storage.
+const AGENT_WINDOW_KEY = "agentWindowId"
+
+async function ensureAgentWindow(): Promise<number | undefined> {
+  if (!chrome.windows || typeof chrome.windows.create !== "function") return undefined
+  const stored = (await sessionArea().get(AGENT_WINDOW_KEY))[AGENT_WINDOW_KEY] as number | undefined
+  if (typeof stored === "number") {
+    const win = await chrome.windows.get(stored).catch(() => undefined)
+    if (win?.id !== undefined && win.type === "normal") return win.id
+  }
+  const created = await chrome.windows.create({ url: "about:blank", focused: false })
+  if (created?.id === undefined) return undefined
+  await sessionArea().set({ [AGENT_WINDOW_KEY]: created.id })
+  return created.id
+}
+
+// Foreground a tab without touching the user's window: move it (with its whole
+// group, so group membership survives) into the agent window, then activate it
+// there.
+async function activateInAgentWindow(tabId: number): Promise<chrome.tabs.Tab | undefined> {
+  const tab = await chrome.tabs.get(tabId)
+  const agentWin = await ensureAgentWindow()
+  if (agentWin !== undefined && tab.windowId !== agentWin) {
+    if (tab.groupId !== undefined && tab.groupId >= 0 && chrome.tabGroups?.move) {
+      await chrome.tabGroups.move(tab.groupId, { windowId: agentWin, index: -1 })
+    } else {
+      await chrome.tabs.move(tabId, { windowId: agentWin, index: -1 })
+    }
+  }
+  return chrome.tabs.update(tabId, { active: true })
+}
+
 // Resolve a normal (groupable) window to birth a new tab in. Precedence:
 //   1. the window that already holds the caller's own group (named label, else
 //      the default group) — so chrome.tabs.group never drags the tab across
@@ -138,13 +173,13 @@ export async function handleTabActions(
                 let updated: chrome.tabs.Tab | undefined = candidate
                 if (action.prepareOnly === true) {
                   updated = reuseActivate
-                    ? await chrome.tabs.update(candidate.id, { active: true })
+                    ? await activateInAgentWindow(candidate.id)
                     : await chrome.tabs.get(candidate.id)
                 } else {
                   const updateProps: chrome.tabs.UpdateProperties = { url: targetUrl }
-                  if (reuseActivate) updateProps.active = true
                   updated = await chrome.tabs.update(candidate.id, updateProps)
                   await waitForTabLoad(candidate.id)
+                  if (reuseActivate) updated = await activateInAgentWindow(candidate.id)
                 }
                 // Pin the reused tab as the auto-target for subsequent commands.
                 // Mirrors the new-tab path below: every successful tab_create
@@ -174,10 +209,10 @@ export async function handleTabActions(
       // resolveNormalWindowPlacement). When a window had to be created, its
       // initial tab already carries the url — creating another would leave an
       // orphan NTP tab. Empty placement → chrome.tabs.create's default.
-      const placement = await resolveNormalWindowPlacement(shouldActivate, targetUrl, group)
+      const placement = await resolveNormalWindowPlacement(false, targetUrl, group)
       const newTab = placement.createdTab ?? await chrome.tabs.create({
         url: targetUrl,
-        active: shouldActivate,
+        active: false,
         ...(placement.windowId !== undefined ? { windowId: placement.windowId } : {})
       })
       if (newTab.id) {
@@ -188,7 +223,7 @@ export async function handleTabActions(
         // into a tab group. Reassert the caller's explicit activation only
         // after group placement completes. This changes the active tab inside
         // the existing browser window but does not focus the browser window.
-        if (shouldActivate) await chrome.tabs.update(newTab.id, { active: true })
+        if (shouldActivate) await activateInAgentWindow(newTab.id)
         // Pin the newly-created tab as the auto-target for subsequent commands
         // so a fresh CLI invocation (no --tab) routes to this tab instead of a
         // stale activeTabId or whatever Chrome reports as "active in currentWindow"
@@ -222,8 +257,9 @@ export async function handleTabActions(
       // stored the switch target under the caller's (per-group or global) key;
       // a handler-side global write would clobber the ungrouped key on
       // grouped switches. Background-first: the switch only retargets unless
-      // the caller passed --activate, so the user's visible tab stays put.
-      if (action.active === true) await chrome.tabs.update(action.tabId as number, { active: true })
+      // the caller passed --activate, and even then the tab is shown in the
+      // agent window, never the user's.
+      if (action.active === true) await activateInAgentWindow(action.tabId as number)
       else await chrome.tabs.get(action.tabId as number)
       return { success: true }
     }

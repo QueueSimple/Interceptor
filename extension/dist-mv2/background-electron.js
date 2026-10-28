@@ -2017,6 +2017,36 @@ function sessionArea4() {
   const storage = chrome.storage;
   return storage.session ?? chrome.storage.local;
 }
+var AGENT_WINDOW_KEY = "agentWindowId";
+async function ensureAgentWindow() {
+  if (!chrome.windows || typeof chrome.windows.create !== "function")
+    return;
+  const stored = (await sessionArea4().get(AGENT_WINDOW_KEY))[AGENT_WINDOW_KEY];
+  if (typeof stored === "number") {
+    const win = await chrome.windows.get(stored).catch(() => {
+      return;
+    });
+    if (win?.id !== undefined && win.type === "normal")
+      return win.id;
+  }
+  const created = await chrome.windows.create({ url: "about:blank", focused: false });
+  if (created?.id === undefined)
+    return;
+  await sessionArea4().set({ [AGENT_WINDOW_KEY]: created.id });
+  return created.id;
+}
+async function activateInAgentWindow(tabId) {
+  const tab = await chrome.tabs.get(tabId);
+  const agentWin = await ensureAgentWindow();
+  if (agentWin !== undefined && tab.windowId !== agentWin) {
+    if (tab.groupId !== undefined && tab.groupId >= 0 && chrome.tabGroups?.move) {
+      await chrome.tabGroups.move(tab.groupId, { windowId: agentWin, index: -1 });
+    } else {
+      await chrome.tabs.move(tabId, { windowId: agentWin, index: -1 });
+    }
+  }
+  return chrome.tabs.update(tabId, { active: true });
+}
 function groupWarningFor(groupId, groupApiAvailable) {
   if (groupId === -1 && groupApiAvailable) {
     return "tab was not added to a tab group (non-normal window or transient group failure) — per-agent group isolation is not in effect for this tab";
@@ -2071,13 +2101,13 @@ async function handleTabActions(action, tabId) {
                 const reuseActivate = action.active === true;
                 let updated = candidate;
                 if (action.prepareOnly === true) {
-                  updated = reuseActivate ? await chrome.tabs.update(candidate.id, { active: true }) : await chrome.tabs.get(candidate.id);
+                  updated = reuseActivate ? await activateInAgentWindow(candidate.id) : await chrome.tabs.get(candidate.id);
                 } else {
                   const updateProps = { url: targetUrl };
-                  if (reuseActivate)
-                    updateProps.active = true;
                   updated = await chrome.tabs.update(candidate.id, updateProps);
                   await waitForTabLoad(candidate.id);
+                  if (reuseActivate)
+                    updated = await activateInAgentWindow(candidate.id);
                 }
                 await sessionArea4().set({ [activeTabKey(group)]: candidate.id });
                 return {
@@ -2090,16 +2120,16 @@ async function handleTabActions(action, tabId) {
         }
       }
       const shouldActivate = action.active === true;
-      const placement = await resolveNormalWindowPlacement(shouldActivate, targetUrl, group);
+      const placement = await resolveNormalWindowPlacement(false, targetUrl, group);
       const newTab = placement.createdTab ?? await chrome.tabs.create({
         url: targetUrl,
-        active: shouldActivate,
+        active: false,
         ...placement.windowId !== undefined ? { windowId: placement.windowId } : {}
       });
       if (newTab.id) {
         const groupId = group ? await addTabToNamedGroup(newTab.id, group, action.groupColor) : await addTabToInterceptorGroup(newTab.id);
         if (shouldActivate)
-          await chrome.tabs.update(newTab.id, { active: true });
+          await activateInAgentWindow(newTab.id);
         await sessionArea4().set({ [activeTabKey(group)]: newTab.id });
         const data = { tabId: newTab.id, url: newTab.url, windowId: newTab.windowId, groupId, group, reused: false };
         const groupWarning = groupWarningFor(groupId, hasTabGroupApi());
@@ -2122,7 +2152,7 @@ async function handleTabActions(action, tabId) {
     }
     case "tab_switch": {
       if (action.active === true)
-        await chrome.tabs.update(action.tabId, { active: true });
+        await activateInAgentWindow(action.tabId);
       else
         await chrome.tabs.get(action.tabId);
       return { success: true };
