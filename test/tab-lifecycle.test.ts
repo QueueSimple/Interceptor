@@ -457,7 +457,7 @@ describe("idle sweep runtime", () => {
     expect(removed.sort()).toEqual([101, 999])
   })
 
-  test("removes named and default stamps on group removal and grants restored groups full grace", async () => {
+  test("removes stamps and creation receipts on group removal, so a restored same-id group is never presumed ours", async () => {
     groups.push({ id: 11, title: "interceptor" })
     local["createdTabGroup:11"] = { label: "", createdAt: 1 }
     tabs.push({ ...mkTab({ id: 102 }), groupId: 11, url: "https://example.test/default" })
@@ -468,7 +468,8 @@ describe("idle sweep runtime", () => {
     await groupRemoved({ id: 11 })
     expect(session["groupLastSeen:s-crashed"]).toBeUndefined()
     expect(session["groupLastSeen:"]).toBeUndefined()
-    // Chrome restores the recorded group ids; titles alone never confer ownership.
+    expect(local["createdTabGroup:11"]).toBeUndefined()
+    // Chrome may restore the same ids; without a receipt the groups are never swept.
     await runTabLifecycleSweep(now)
     expect(removed).toEqual([])
     now += 9 * 60_000
@@ -476,7 +477,17 @@ describe("idle sweep runtime", () => {
     expect(removed).toEqual([])
     now += 60_000
     await runTabLifecycleSweep(now)
-    expect(removed.sort()).toEqual([101, 102])
+    expect(removed).toEqual([])
+  })
+
+  test("a receipt whose id now names a personal group never closes it (ids are only unique per browser session)", async () => {
+    groups = [{ id: 10, title: "Personal" }]
+    local["createdTabGroup:10"] = { label: "s-crashed", createdAt: 1 }
+    session["groupLastSeen:s-crashed"] = 1
+    await runTabLifecycleSweep(now)
+    now += 60 * 60_000
+    await runTabLifecycleSweep(now)
+    expect(removed).toEqual([])
   })
 
   test("sweeps every recorded duplicate default-title group in one tick", async () => {

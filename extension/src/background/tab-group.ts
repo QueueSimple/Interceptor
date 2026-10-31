@@ -53,7 +53,7 @@ async function createGroupInTabWindow(tabId: number, label: string): Promise<num
   return groupId
 }
 
-/** Durable creation receipts, including closed ids so same-id restore gets grace. */
+/** Durable creation receipts for live groups; onRemoved deletes a closed group's receipt. */
 export async function readCreatedTabGroups(): Promise<Array<{ label: string; groupId: number }>> {
   try {
     const stored = await chrome.storage.local.get(null)
@@ -414,6 +414,13 @@ export function registerTabGroupListeners(): void {
       if (activityLabel !== null) {
         try {
           await (sessionArea() ?? chrome.storage.local).remove(`groupLastSeen:${activityLabel}`)
+        } catch {}
+      }
+      // A closed group's receipt goes with it, so the record never grows past the
+      // live groups and a later group that reuses this id is never presumed ours.
+      if (receipt) {
+        try {
+          await chrome.storage.local.remove(`createdTabGroup:${group.id}`)
         } catch {}
       }
     })

@@ -20,6 +20,7 @@
  */
 
 import { hasTabGroupApi, readCreatedTabGroups } from "./tab-group"
+import { getCandidateTitles } from "./brand-tab-group"
 
 export type TabLifecycle = { reuse: boolean; idleCloseMinutes: number }
 export type TabLifecycleSource = "managed" | "local" | "default"
@@ -261,8 +262,15 @@ export async function runTabLifecycleSweep(now = Date.now()): Promise<void> {
   // Titles and dispatch adoption are not ownership evidence. Local creation
   // receipts survive reload and enumerate every duplicate, including defaults.
   const liveGroups = await chrome.tabGroups.query({})
-  const liveIds = new Set(liveGroups.map((g) => g.id))
-  const groups = (await readCreatedTabGroups()).filter((g) => liveIds.has(g.groupId))
+  // Ownership needs both proofs: a creation receipt for this id AND a live title
+  // that is still Interceptor's for that label. Chrome only promises group ids are
+  // unique within one browser session, so an id alone could name a personal group.
+  const liveTitles = new Map(liveGroups.map((g) => [g.id, g.title ?? ""]))
+  const brandTitles = await getCandidateTitles()
+  const ownsTitle = (label: string, title: string) =>
+    brandTitles.some((brand) => title === (label === "" ? brand : `${brand}-${label}`))
+  const groups = (await readCreatedTabGroups()).filter((g) =>
+    liveTitles.has(g.groupId) && ownsTitle(g.label, liveTitles.get(g.groupId)!))
   if (groups.length === 0) return
   // Duplicate labels share activity, but a survivor's refresh must not postpone
   // another idle duplicate in this tick. Read all stamps before any removals.
