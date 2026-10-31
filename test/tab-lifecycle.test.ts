@@ -11,7 +11,7 @@ import {
   DEFAULT_TAB_LIFECYCLE,
   type SweepTab,
 } from "../extension/src/background/tab-lifecycle"
-import { namedGroups } from "../extension/src/background/tab-group"
+import { namedGroups, addTabToNamedGroup, addTabToInterceptorGroup, registerTabGroupListeners } from "../extension/src/background/tab-group"
 import { buildTabCreateAction } from "../cli/commands/compound"
 import { parseTabsCommand } from "../cli/commands/tabs"
 
@@ -275,6 +275,8 @@ describe("idle sweep runtime", () => {
   let alarmListener: (alarm: { name: string }) => void
   let alarm: { name: string } | undefined
   let created: unknown[]
+  let groupRemoved: (group: { id: number }) => Promise<void>
+  let nextGroupId: number
 
   beforeEach(() => {
     savedChrome = global.chrome
@@ -283,7 +285,8 @@ describe("idle sweep runtime", () => {
     now = 1_800_000
     clock = spyOn(Date, "now").mockImplementation(() => now)
     session = {}
-    local = {}
+    local = { "createdTabGroup:10": { label: "s-crashed", createdAt: 1 } }
+    nextGroupId = 30
     groups = [{ id: 10, title: "interceptor-s-crashed" }]
     tabs = [
       { ...mkTab({ id: 101 }), groupId: 10, url: "https://example.test/" },
@@ -293,13 +296,16 @@ describe("idle sweep runtime", () => {
     alarm = undefined
     created = []
     const area = (data: Record<string, unknown>) => ({
-      get: async (key: string) => ({ [key]: data[key] }),
+      get: async (key: string | null) => key === null ? { ...data } : ({ [key]: data[key] }),
+      remove: async (key: string) => { delete data[key] },
       set: async (values: Record<string, unknown>) => { Object.assign(data, values) },
     })
     global.chrome = {
       storage: { session: area(session), local: area(local) },
       tabGroups: {
         query: async () => groups,
+        update: async (id: number, values: { title?: string }) => { Object.assign(groups.find((g) => g.id === id)!, values) },
+        onRemoved: { addListener: (listener: typeof groupRemoved) => { groupRemoved = listener } },
         get: async (id: number) => {
           const group = groups.find((g) => g.id === id)
           if (!group) throw new Error("no group")
@@ -308,6 +314,14 @@ describe("idle sweep runtime", () => {
       },
       windows: { getLastFocused: async () => ({ id: 1, focused: true }) },
       tabs: {
+        onRemoved: { addListener: () => {} },
+        get: async (id: number) => tabs.find((t) => t.id === id),
+        group: async (options: { tabIds: number; groupId?: number }) => {
+          const id = options.groupId ?? nextGroupId++
+          if (!groups.some((g) => g.id === id)) groups.push({ id, title: "" })
+          tabs.find((t) => t.id === options.tabIds)!.groupId = id
+          return id
+        },
         query: async (query: { groupId?: number }) => tabs.filter((t) => query.groupId === undefined || t.groupId === query.groupId),
         remove: async (ids: number[]) => {
           removed.push(...ids)
@@ -330,7 +344,7 @@ describe("idle sweep runtime", () => {
     for (const [label, id] of savedGroups) namedGroups.set(label, id)
   })
 
-  test("rediscovers an unregistered group after reload, grants grace, then closes it", async () => {
+  test("rediscovers a recorded group after reload, grants grace, then closes it", async () => {
     await runTabLifecycleSweep(now)
     expect(removed).toEqual([])
     now += 9 * 60_000
@@ -372,6 +386,8 @@ describe("idle sweep runtime", () => {
   test("preserves the last window tab across multiple idle groups", async () => {
     namedGroups.set("a", 10)
     namedGroups.set("b", 11)
+    local["createdTabGroup:10"] = { label: "a", createdAt: 1 }
+    local["createdTabGroup:11"] = { label: "b", createdAt: 1 }
     session["groupLastSeen:a"] = 1
     session["groupLastSeen:b"] = 1
     groups = [{ id: 10, title: "interceptor-a" }, { id: 11, title: "interceptor-b" }]
@@ -381,6 +397,9 @@ describe("idle sweep runtime", () => {
     ]
     await runTabLifecycleSweep(now)
     expect(removed).toEqual([101])
+    expect(tabs.map((t) => t.id)).toEqual([102])
+    now += 30 * 60_000
+    await runTabLifecycleSweep(now)
     expect(tabs.map((t) => t.id)).toEqual([102])
   })
 
@@ -404,6 +423,133 @@ describe("idle sweep runtime", () => {
     registerTabLifecycle()
     await Bun.sleep(0)
     expect(created).toEqual([])
+  })
+
+
+  test("never sweeps personal groups with default, named, or free-form brand titles", async () => {
+    session.brandTabGroupPrevTitle = "Work"
+    groups.push({ id: 11, title: "interceptor-research" }, { id: 12, title: "Work-notes" }, { id: 13, title: "interceptor" })
+    for (const id of [11, 12, 13]) tabs.push({ ...mkTab({ id: id * 10 }), groupId: id, url: "https://personal.test/" })
+    // Even title-adopted dispatch registries are not proof of creation.
+    namedGroups.set("research", 11)
+    await runTabLifecycleSweep(now)
+    now += 10 * 60_000
+    await runTabLifecycleSweep(now)
+    expect(removed).toEqual([101])
+    expect(tabs.map((t) => t.id)).toEqual([999, 110, 120, 130])
+  })
+
+  test("persists ownership only for newly created named and default groups", async () => {
+    groups = []
+    tabs[0].groupId = -1
+    const namedId = await addTabToNamedGroup(101, "fresh")
+    const defaultId = await addTabToInterceptorGroup(999)
+    expect(local[`createdTabGroup:${namedId}`]).toEqual({ label: "fresh", createdAt: now })
+    expect(local[`createdTabGroup:${defaultId}`]).toEqual({ label: "", createdAt: now })
+    // Clear session/dispatch state, as an extension reload does. Local proof survives.
+    for (const key of Object.keys(session)) delete session[key]
+    namedGroups.clear()
+    tabs.push({ ...mkTab({ id: 1000, active: true }), groupId: -1, url: "https://personal.test/" })
+    tabs.find((t) => t.id === 999)!.active = false
+    await runTabLifecycleSweep(now)
+    now += 10 * 60_000
+    await runTabLifecycleSweep(now)
+    expect(removed.sort()).toEqual([101, 999])
+  })
+
+  test("removes named and default stamps on group removal and grants restored groups full grace", async () => {
+    groups.push({ id: 11, title: "interceptor" })
+    local["createdTabGroup:11"] = { label: "", createdAt: 1 }
+    tabs.push({ ...mkTab({ id: 102 }), groupId: 11, url: "https://example.test/default" })
+    session["groupLastSeen:s-crashed"] = 1
+    session["groupLastSeen:"] = 1
+    registerTabGroupListeners()
+    await groupRemoved({ id: 10 })
+    await groupRemoved({ id: 11 })
+    expect(session["groupLastSeen:s-crashed"]).toBeUndefined()
+    expect(session["groupLastSeen:"]).toBeUndefined()
+    // Chrome restores the recorded group ids; titles alone never confer ownership.
+    await runTabLifecycleSweep(now)
+    expect(removed).toEqual([])
+    now += 9 * 60_000
+    await runTabLifecycleSweep(now)
+    expect(removed).toEqual([])
+    now += 60_000
+    await runTabLifecycleSweep(now)
+    expect(removed.sort()).toEqual([101, 102])
+  })
+
+  test("sweeps every recorded duplicate default-title group in one tick", async () => {
+    groups = [{ id: 10, title: "interceptor" }, { id: 11, title: "interceptor" }, { id: 12, title: "interceptor" }]
+    local["createdTabGroup:10"] = { label: "", createdAt: 1 }
+    local["createdTabGroup:11"] = { label: "", createdAt: 1 }
+    session["groupLastSeen:"] = 1
+    tabs.push({ ...mkTab({ id: 102 }), groupId: 11, url: "https://example.test/duplicate" })
+    tabs.push({ ...mkTab({ id: 103 }), groupId: 12, url: "https://personal.test/duplicate" })
+    await runTabLifecycleSweep(now)
+    expect(removed).toEqual([101, 102])
+    expect(tabs.map((t) => t.id)).toEqual([999, 103])
+  })
+
+  test("refreshes window counts after partial removal failure before sweeping the next group", async () => {
+    groups = [{ id: 10, title: "interceptor-a" }, { id: 11, title: "interceptor-b" }]
+    local["createdTabGroup:10"] = { label: "a", createdAt: 1 }
+    local["createdTabGroup:11"] = { label: "b", createdAt: 1 }
+    namedGroups.set("a", 10)
+    namedGroups.set("b", 11)
+    session["groupLastSeen:a"] = session["groupLastSeen:b"] = 1
+    tabs = [101, 102, 103].map((id) => ({ ...mkTab({ id, windowId: 2 }), groupId: id === 103 ? 11 : 10, url: "https://example.test/" }))
+    const remove = chrome.tabs.remove
+    chrome.tabs.remove = (async (ids: number[]) => {
+      await remove(ids)
+      if (ids.includes(101)) throw new Error("partial remove")
+    }) as typeof remove
+    await runTabLifecycleSweep(now)
+    expect(removed).toEqual([101, 102])
+    expect(tabs.map((t) => t.id)).toEqual([103])
+  })
+
+
+  test("title adoption never writes a creation receipt", async () => {
+    groups.push({ id: 11, title: "interceptor-personal" })
+    await addTabToNamedGroup(101, "personal")
+    expect(local["createdTabGroup:11"]).toBeUndefined()
+  })
+
+  test("unavailable ownership storage leaves all tabs alone", async () => {
+    session["groupLastSeen:s-crashed"] = 1
+    const get = chrome.storage.local.get
+    chrome.storage.local.get = (async (key: string | null) => {
+      if (key === null) throw new Error("ownership storage unavailable")
+      return get(key)
+    }) as typeof get
+    await runTabLifecycleSweep(now)
+    expect(removed).toEqual([])
+  })
+
+  test("a survivor in one default duplicate does not postpone the other duplicate", async () => {
+    groups = [{ id: 10, title: "interceptor" }, { id: 11, title: "interceptor" }]
+    local["createdTabGroup:10"] = local["createdTabGroup:11"] = { label: "", createdAt: 1 }
+    session["groupLastSeen:"] = 1
+    tabs.push({ ...mkTab({ id: 102, pinned: true }), groupId: 10, url: "https://example.test/pinned" })
+    tabs.push({ ...mkTab({ id: 103 }), groupId: 11, url: "https://example.test/duplicate" })
+    await runTabLifecycleSweep(now)
+    expect(removed).toEqual([101, 103])
+    expect(tabs.map((t) => t.id)).toEqual([999, 102])
+  })
+
+  test("a full sweep does not recreate a stamp cleared by the removal listener", async () => {
+    session["groupLastSeen:s-crashed"] = 1
+    registerTabGroupListeners()
+    const remove = chrome.tabs.remove
+    chrome.tabs.remove = (async (ids: number[]) => {
+      await remove(ids)
+      groups = []
+      await groupRemoved({ id: 10 })
+    }) as typeof remove
+    await runTabLifecycleSweep(now)
+    expect(removed).toEqual([101])
+    expect(session["groupLastSeen:s-crashed"]).toBeUndefined()
   })
 
   test("respects a stored disabled policy", async () => {

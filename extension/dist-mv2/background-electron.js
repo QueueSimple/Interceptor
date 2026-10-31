@@ -58,11 +58,17 @@ async function isTabInNormalWindow(tabId) {
     return true;
   }
 }
-async function createGroupInTabWindow(tabId) {
+async function createGroupInTabWindow(tabId, label) {
   const tab = await chrome.tabs.get(tabId).catch(() => {
     return;
   });
-  return chrome.tabs.group(tab?.windowId !== undefined ? { tabIds: tabId, createProperties: { windowId: tab.windowId } } : { tabIds: tabId });
+  const groupId = await chrome.tabs.group(tab?.windowId !== undefined ? { tabIds: tabId, createProperties: { windowId: tab.windowId } } : { tabIds: tabId });
+  try {
+    await chrome.storage.local.set({
+      [`createdTabGroup:${groupId}`]: { label, createdAt: Date.now() }
+    });
+  } catch {}
+  return groupId;
 }
 var GROUP_LABEL_RE = /^[A-Za-z0-9_-]{1,32}$/;
 var SESSION_NAMED_GROUPS_KEY = "namedTabGroups";
@@ -150,7 +156,7 @@ async function addTabToNamedGroupSerialized(tabId, label, colorOverride) {
   let groupId = await ensureNamedGroup(label);
   try {
     if (groupId === -1) {
-      groupId = await createGroupInTabWindow(tabId);
+      groupId = await createGroupInTabWindow(tabId, label);
       const color = typeof colorOverride === "string" && VALID_COLORS.includes(colorOverride) ? normalizeColor(colorOverride) : colorForLabel(label);
       await chrome.tabGroups.update(groupId, {
         title: groupTitleFor(label),
@@ -267,7 +273,7 @@ async function addTabToInterceptorGroupSerialized(tabId) {
     return -1;
   try {
     if (groupId === -1) {
-      groupId = await createGroupInTabWindow(tabId);
+      groupId = await createGroupInTabWindow(tabId, "");
       await chrome.tabGroups.update(groupId, {
         title: getTabGroupTitle(),
         color: getTabGroupColor()

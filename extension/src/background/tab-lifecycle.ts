@@ -19,8 +19,7 @@
  * accessors, and registerTabLifecycle() is called ONLY from the MV3 background.ts entry.
  */
 
-import { hasTabGroupApi, ensureInterceptorGroup, hydrateNamedGroups, namedGroups, GROUP_LABEL_RE } from "./tab-group"
-import { getCandidateTitles } from "./brand-tab-group"
+import { hasTabGroupApi, readCreatedTabGroups } from "./tab-group"
 
 export type TabLifecycle = { reuse: boolean; idleCloseMinutes: number }
 export type TabLifecycleSource = "managed" | "local" | "default"
@@ -259,26 +258,16 @@ export async function runTabLifecycleSweep(now = Date.now()): Promise<void> {
   if (policy.idleCloseMinutes <= 0) return
   const cutoffMs = policy.idleCloseMinutes * 60_000
 
-  // Candidate groups: the default brand group ("") + registered and rediscovered
-  // named groups. storage.session is cleared on extension reload/update and
-  // browser restart, even when the tab strip keeps/restores the groups.
-  await hydrateNamedGroups()
-  const groups: Array<{ label: string; groupId: number }> = []
-  const defaultGid = await ensureInterceptorGroup()
-  if (defaultGid !== -1) groups.push({ label: "", groupId: defaultGid })
-  for (const [label, gid] of namedGroups) groups.push({ label, groupId: gid })
-  const seen = new Set(groups.map((g) => g.groupId))
-  const titles = await getCandidateTitles()
-  const prefixes = titles.map((title) => title + "-").sort((a, b) => b.length - a.length)
-  for (const group of await chrome.tabGroups.query({}).catch(() => [])) {
-    if (seen.has(group.id) || typeof group.title !== "string" || titles.includes(group.title)) continue
-    const title = group.title
-    const prefix = prefixes.find((p) => title.startsWith(p) && GROUP_LABEL_RE.test(title.slice(p.length)))
-    if (!prefix) continue
-    groups.push({ label: title.slice(prefix.length), groupId: group.id })
-    seen.add(group.id)
-  }
+  // Titles and dispatch adoption are not ownership evidence. Local creation
+  // receipts survive reload and enumerate every duplicate, including defaults.
+  const liveGroups = await chrome.tabGroups.query({})
+  const liveIds = new Set(liveGroups.map((g) => g.id))
+  const groups = (await readCreatedTabGroups()).filter((g) => liveIds.has(g.groupId))
   if (groups.length === 0) return
+  // Duplicate labels share activity, but a survivor's refresh must not postpone
+  // another idle duplicate in this tick. Read all stamps before any removals.
+  const stamps = new Map(await Promise.all([...new Set(groups.map((g) => g.label))]
+    .map(async (label) => [label, await readStamp(label)] as const)))
 
   // Shared context for the guards, resolved once per tick.
   let focusedWindowId: number | null = null
@@ -288,13 +277,17 @@ export async function runTabLifecycleSweep(now = Date.now()): Promise<void> {
   } catch {}
   const allTabs = await chrome.tabs.query({})
   const windowTabCounts = new Map<number, number>()
-  for (const t of allTabs) {
-    if (t.windowId === undefined) continue
-    windowTabCounts.set(t.windowId, (windowTabCounts.get(t.windowId) ?? 0) + 1)
+  const updateWindowCounts = (tabs: chrome.tabs.Tab[]) => {
+    windowTabCounts.clear()
+    for (const t of tabs) {
+      if (t.windowId === undefined) continue
+      windowTabCounts.set(t.windowId, (windowTabCounts.get(t.windowId) ?? 0) + 1)
+    }
   }
+  updateWindowCounts(allTabs)
 
   for (const { label, groupId } of groups) {
-    const stamp = await readStamp(label)
+    const stamp = stamps.get(label)
     if (stamp === undefined) {
       // No stamp (pre-existing group, or stamps lost with the session): grace-stamp
       // now so the group gets one full idle window before it is ever a candidate.
@@ -347,6 +340,11 @@ export async function runTabLifecycleSweep(now = Date.now()): Promise<void> {
       await chrome.tabs.remove(closeIds)
     } catch (err) {
       console.warn(`tab-lifecycle sweep: remove failed for group '${label || "(default)"}':`, err)
+      // A rejected array removal may already have closed some tabs. Later
+      // groups must see real counts or they could close the window's last tab.
+      const remaining = await chrome.tabs.query({}).catch(() => undefined)
+      if (!remaining) return // Unknown counts: stop this tick conservatively.
+      updateWindowCounts(remaining)
       continue
     }
     // G5 applies across the whole tick, not independently to each group:
@@ -356,10 +354,9 @@ export async function runTabLifecycleSweep(now = Date.now()): Promise<void> {
       const count = windowTabCounts.get(tab.windowId)
       if (count !== undefined) windowTabCounts.set(tab.windowId, count - 1)
     }
-    // Survivors (guard-vetoed tabs) get a fresh idle window rather than a
-    // re-attack on every subsequent tick. A fully swept group's stamp is moot —
-    // the group is gone and tabGroups.onRemoved purges its registry entry.
-    recordGroupActivity(label)
+    // Refresh survivors only. Restamping a vanished group could race with
+    // onRemoved's cleanup and make a later restore inherit this stale stamp.
+    if (closeIds.length < sweepTabs.length) recordGroupActivity(label)
     const summary = {
       at: new Date(now).toISOString(),
       group: label || "(default)",

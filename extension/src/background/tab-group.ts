@@ -34,13 +34,42 @@ async function isTabInNormalWindow(tabId: number): Promise<boolean> {
  * a freshly created background window (collapsing it) and lands agent groups in
  * whichever window the user last touched.
  */
-async function createGroupInTabWindow(tabId: number): Promise<number> {
+async function createGroupInTabWindow(tabId: number, label: string): Promise<number> {
   const tab = await chrome.tabs.get(tabId).catch(() => undefined)
-  return chrome.tabs.group(
+  const groupId = await chrome.tabs.group(
     tab?.windowId !== undefined
       ? { tabIds: tabId, createProperties: { windowId: tab.windowId } }
       : { tabIds: tabId }
   )
+  // Only this successful creation call establishes sweep ownership. Adopting a
+  // matching title must never turn a personal group into an idle-close target.
+  try {
+    await chrome.storage.local.set({
+      [`createdTabGroup:${groupId}`]: { label, createdAt: Date.now() },
+    })
+  } catch {
+    // Fail closed: without durable proof the reaper must leave the group alone.
+  }
+  return groupId
+}
+
+/** Durable creation receipts, including closed ids so same-id restore gets grace. */
+export async function readCreatedTabGroups(): Promise<Array<{ label: string; groupId: number }>> {
+  try {
+    const stored = await chrome.storage.local.get(null)
+    return Object.entries(stored).flatMap(([key, value]) => {
+      const match = /^createdTabGroup:(\d+)$/.exec(key)
+      if (!match || !value || typeof value !== "object") return []
+      const { label, createdAt } = value as { label?: unknown; createdAt?: unknown }
+      const groupId = Number(match[1])
+      if (!Number.isSafeInteger(groupId) || typeof label !== "string"
+        || (label !== "" && !GROUP_LABEL_RE.test(label))
+        || typeof createdAt !== "number" || !Number.isFinite(createdAt)) return []
+      return [{ label, groupId }]
+    })
+  } catch {
+    return []
+  }
 }
 
 // --- Named per-agent groups ------------------------------------------------
@@ -163,7 +192,7 @@ async function addTabToNamedGroupSerialized(
   let groupId = await ensureNamedGroup(label)
   try {
     if (groupId === -1) {
-      groupId = await createGroupInTabWindow(tabId)
+      groupId = await createGroupInTabWindow(tabId, label)
       const color = typeof colorOverride === "string" && (VALID_COLORS as readonly string[]).includes(colorOverride)
         ? normalizeColor(colorOverride)
         : colorForLabel(label)
@@ -321,7 +350,7 @@ async function addTabToInterceptorGroupSerialized(tabId: number): Promise<number
   if (!(await isTabInNormalWindow(tabId))) return -1
   try {
     if (groupId === -1) {
-      groupId = await createGroupInTabWindow(tabId)
+      groupId = await createGroupInTabWindow(tabId, "")
       await chrome.tabGroups.update(groupId, {
         title: getTabGroupTitle(),
         color: getTabGroupColor() as `${chrome.tabGroups.Color}`,
@@ -380,6 +409,13 @@ export function registerTabGroupListeners(): void {
       await hydrateNamedGroups()
       const label = labelForGroupId(group.id)
       if (label !== null) await purgeNamedGroupEntry(label)
+      const receipt = (await readCreatedTabGroups()).find((g) => g.groupId === group.id)
+      const activityLabel = receipt?.label ?? label
+      if (activityLabel !== null) {
+        try {
+          await (sessionArea() ?? chrome.storage.local).remove(`groupLastSeen:${activityLabel}`)
+        } catch {}
+      }
     })
   }
 }
