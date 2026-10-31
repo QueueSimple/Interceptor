@@ -19,7 +19,8 @@
  * accessors, and registerTabLifecycle() is called ONLY from the MV3 background.ts entry.
  */
 
-import { hasTabGroupApi, ensureInterceptorGroup, hydrateNamedGroups, namedGroups } from "./tab-group"
+import { hasTabGroupApi, ensureInterceptorGroup, hydrateNamedGroups, namedGroups, GROUP_LABEL_RE } from "./tab-group"
+import { getCandidateTitles } from "./brand-tab-group"
 
 export type TabLifecycle = { reuse: boolean; idleCloseMinutes: number }
 export type TabLifecycleSource = "managed" | "local" | "default"
@@ -31,8 +32,9 @@ const SWEEP_ALARM = "tabLifecycleSweep"
 const SWEEP_LOG_KEY = "tabLifecycleSweepLog"
 const SWEEP_LOG_CAP = 50
 const DIRTY_CHECK_TIMEOUT_MS = 2_000
-// Liveness stamps live in storage.session: same lifetime as tab/group ids (both die
-// with the browser), so a stamp can never describe ids that no longer exist.
+// Liveness stamps live in storage.session and survive service-worker restarts.
+// Extension reload/update or browser restart clears them; surviving/restored
+// tab-strip groups must be rediscovered and given a fresh grace window.
 const GROUP_LAST_SEEN_PREFIX = "groupLastSeen:"
 
 /** Validate/clamp a raw stored value into a complete policy. Never throws. */
@@ -257,12 +259,25 @@ export async function runTabLifecycleSweep(now = Date.now()): Promise<void> {
   if (policy.idleCloseMinutes <= 0) return
   const cutoffMs = policy.idleCloseMinutes * 60_000
 
-  // Candidate groups: the default brand group ("") + every registered named group.
+  // Candidate groups: the default brand group ("") + registered and rediscovered
+  // named groups. storage.session is cleared on extension reload/update and
+  // browser restart, even when the tab strip keeps/restores the groups.
   await hydrateNamedGroups()
   const groups: Array<{ label: string; groupId: number }> = []
   const defaultGid = await ensureInterceptorGroup()
   if (defaultGid !== -1) groups.push({ label: "", groupId: defaultGid })
   for (const [label, gid] of namedGroups) groups.push({ label, groupId: gid })
+  const seen = new Set(groups.map((g) => g.groupId))
+  const titles = await getCandidateTitles()
+  const prefixes = titles.map((title) => title + "-").sort((a, b) => b.length - a.length)
+  for (const group of await chrome.tabGroups.query({}).catch(() => [])) {
+    if (seen.has(group.id) || typeof group.title !== "string" || titles.includes(group.title)) continue
+    const title = group.title
+    const prefix = prefixes.find((p) => title.startsWith(p) && GROUP_LABEL_RE.test(title.slice(p.length)))
+    if (!prefix) continue
+    groups.push({ label: title.slice(prefix.length), groupId: group.id })
+    seen.add(group.id)
+  }
   if (groups.length === 0) return
 
   // Shared context for the guards, resolved once per tick.
@@ -333,6 +348,13 @@ export async function runTabLifecycleSweep(now = Date.now()): Promise<void> {
     } catch (err) {
       console.warn(`tab-lifecycle sweep: remove failed for group '${label || "(default)"}':`, err)
       continue
+    }
+    // G5 applies across the whole tick, not independently to each group:
+    // later groups must see the tabs already removed from their window.
+    for (const tab of sweepTabs) {
+      if (!closeIds.includes(tab.id)) continue
+      const count = windowTabCounts.get(tab.windowId)
+      if (count !== undefined) windowTabCounts.set(tab.windowId, count - 1)
     }
     // Survivors (guard-vetoed tabs) get a fresh idle window rather than a
     // re-attack on every subsequent tick. A fully swept group's stamp is moot —

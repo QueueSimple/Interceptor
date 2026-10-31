@@ -1,20 +1,22 @@
-import { afterEach, beforeEach, describe, expect, test } from "bun:test"
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test"
 import {
   normalizeTabLifecycle,
   resolveTabLifecycle,
   policyMayDecideReuse,
   selectSweepCandidates,
   boundedDirtyInspection,
+  runTabLifecycleSweep,
+  registerTabLifecycle,
+  recordGroupActivity,
   DEFAULT_TAB_LIFECYCLE,
   type SweepTab,
 } from "../extension/src/background/tab-lifecycle"
+import { namedGroups } from "../extension/src/background/tab-group"
 import { buildTabCreateAction } from "../cli/commands/compound"
 import { parseTabsCommand } from "../cli/commands/tabs"
 
-// Tab-lifecycle unit tests. The sweep/normalize/precedence units are pure
-// or storage-only, so no browser is needed; the live behaviors (beforeunload
-// bypass, shared-stamp liveness, SW-restart survival, session restore) are
-// verified against a real browser post-install.
+// Tab-lifecycle tests use pure helpers and mocked Chrome APIs, including the
+// real alarm/sweep path. No running browser or extension reload is needed.
 
 // ── T1: normalizeTabLifecycle never throws, always yields a valid policy ──────
 
@@ -254,5 +256,161 @@ describe("reuse gating (T4)", () => {
     // explicit decisions always win
     expect(policyMayDecideReuse({ reuse: true, reusePolicy: true, group: "ai7" })).toBe(false)
     expect(policyMayDecideReuse({ reuse: false, reusePolicy: true, group: "ai7" })).toBe(false)
+  })
+})
+
+// Exercise the real alarm -> discovery -> stamp -> guard -> removal path.
+// Extension reload clears storage.session while tab-strip groups survive.
+describe("idle sweep runtime", () => {
+  const global = globalThis as unknown as { chrome?: unknown }
+  let savedChrome: unknown
+  let savedGroups: Map<string, number>
+  let clock: ReturnType<typeof spyOn>
+  let now: number
+  let session: Record<string, unknown>
+  let local: Record<string, unknown>
+  let groups: Array<{ id: number; title: string }>
+  let tabs: Array<SweepTab & { groupId: number; url: string }>
+  let removed: number[]
+  let alarmListener: (alarm: { name: string }) => void
+  let alarm: { name: string } | undefined
+  let created: unknown[]
+
+  beforeEach(() => {
+    savedChrome = global.chrome
+    savedGroups = new Map(namedGroups)
+    namedGroups.clear()
+    now = 1_800_000
+    clock = spyOn(Date, "now").mockImplementation(() => now)
+    session = {}
+    local = {}
+    groups = [{ id: 10, title: "interceptor-s-crashed" }]
+    tabs = [
+      { ...mkTab({ id: 101 }), groupId: 10, url: "https://example.test/" },
+      { ...mkTab({ id: 999, active: true }), groupId: -1, url: "https://personal.test/" },
+    ]
+    removed = []
+    alarm = undefined
+    created = []
+    const area = (data: Record<string, unknown>) => ({
+      get: async (key: string) => ({ [key]: data[key] }),
+      set: async (values: Record<string, unknown>) => { Object.assign(data, values) },
+    })
+    global.chrome = {
+      storage: { session: area(session), local: area(local) },
+      tabGroups: {
+        query: async () => groups,
+        get: async (id: number) => {
+          const group = groups.find((g) => g.id === id)
+          if (!group) throw new Error("no group")
+          return group
+        },
+      },
+      windows: { getLastFocused: async () => ({ id: 1, focused: true }) },
+      tabs: {
+        query: async (query: { groupId?: number }) => tabs.filter((t) => query.groupId === undefined || t.groupId === query.groupId),
+        remove: async (ids: number[]) => {
+          removed.push(...ids)
+          tabs = tabs.filter((t) => !ids.includes(t.id))
+        },
+      },
+      scripting: { executeScript: async () => [{ result: false }] },
+      alarms: {
+        get: async () => alarm,
+        create: async (name: string, options: unknown) => { created.push({ name, options }); alarm = { name } },
+        onAlarm: { addListener: (listener: typeof alarmListener) => { alarmListener = listener } },
+      },
+    }
+  })
+
+  afterEach(() => {
+    clock.mockRestore()
+    global.chrome = savedChrome
+    namedGroups.clear()
+    for (const [label, id] of savedGroups) namedGroups.set(label, id)
+  })
+
+  test("rediscovers an unregistered group after reload, grants grace, then closes it", async () => {
+    await runTabLifecycleSweep(now)
+    expect(removed).toEqual([])
+    now += 9 * 60_000
+    await runTabLifecycleSweep(now)
+    expect(removed).toEqual([])
+    now += 60_000
+    await runTabLifecycleSweep(now)
+    expect(removed).toEqual([101])
+    expect(tabs.map((t) => t.id)).toEqual([999])
+    expect(local.tabLifecycleSweepLog).toMatchObject([{ group: "s-crashed", idleMinutes: 10, closed: 1 }])
+  })
+
+  test("rediscovers an idle group even when another named group is registered", async () => {
+    namedGroups.set("other", 20)
+    recordGroupActivity("s-crashed")
+    await Promise.resolve()
+    now += 10 * 60_000
+    await runTabLifecycleSweep(now)
+    expect(removed).toEqual([101])
+  })
+
+  test("rediscovers a previous-brand group but ignores personal and invalid-label groups", async () => {
+    session.brandTabGroupPrevTitle = "old-brand"
+    groups = [
+      { id: 10, title: "old-brand-s-crashed" },
+      { id: 11, title: "personal" },
+      { id: 12, title: "interceptor-invalid label" },
+    ]
+    tabs.push(
+      { ...mkTab({ id: 102 }), groupId: 11, url: "https://personal.test/" },
+      { ...mkTab({ id: 103 }), groupId: 12, url: "https://personal.test/" },
+    )
+    await runTabLifecycleSweep(now)
+    now += 10 * 60_000
+    await runTabLifecycleSweep(now)
+    expect(removed).toEqual([101])
+  })
+
+  test("preserves the last window tab across multiple idle groups", async () => {
+    namedGroups.set("a", 10)
+    namedGroups.set("b", 11)
+    session["groupLastSeen:a"] = 1
+    session["groupLastSeen:b"] = 1
+    groups = [{ id: 10, title: "interceptor-a" }, { id: 11, title: "interceptor-b" }]
+    tabs = [
+      { ...mkTab({ id: 101, windowId: 2 }), groupId: 10, url: "https://example.test/a" },
+      { ...mkTab({ id: 102, windowId: 2 }), groupId: 11, url: "https://example.test/b" },
+    ]
+    await runTabLifecycleSweep(now)
+    expect(removed).toEqual([101])
+    expect(tabs.map((t) => t.id)).toEqual([102])
+  })
+
+  test("recreates a missing alarm on worker startup and its tick closes idle tabs", async () => {
+    namedGroups.set("s-crashed", 10)
+    session["groupLastSeen:s-crashed"] = 1
+    registerTabLifecycle()
+    // Alarm setup and the event-driven sweep are intentionally fire-and-forget.
+    await Bun.sleep(0)
+    expect(created).toEqual([{ name: "tabLifecycleSweep", options: { periodInMinutes: 1 } }])
+    alarmListener({ name: "unrelated" })
+    await Bun.sleep(0)
+    expect(removed).toEqual([])
+    alarmListener({ name: "tabLifecycleSweep" })
+    await Bun.sleep(0)
+    expect(removed).toEqual([101])
+  })
+
+  test("keeps an existing alarm rather than postponing its next tick", async () => {
+    alarm = { name: "tabLifecycleSweep" }
+    registerTabLifecycle()
+    await Bun.sleep(0)
+    expect(created).toEqual([])
+  })
+
+  test("respects a stored disabled policy", async () => {
+    namedGroups.set("s-crashed", 10)
+    session["groupLastSeen:s-crashed"] = 1
+    local.tabLifecycle = { reuse: true, idleCloseMinutes: 0 }
+    await runTabLifecycleSweep(now)
+    expect(removed).toEqual([])
   })
 })
