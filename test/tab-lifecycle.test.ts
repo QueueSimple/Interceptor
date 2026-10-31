@@ -297,7 +297,7 @@ describe("idle sweep runtime", () => {
     created = []
     const area = (data: Record<string, unknown>) => ({
       get: async (key: string | null) => key === null ? { ...data } : ({ [key]: data[key] }),
-      remove: async (key: string) => { delete data[key] },
+      remove: async (key: string | string[]) => { for (const k of [key].flat()) delete data[k] },
       set: async (values: Record<string, unknown>) => { Object.assign(data, values) },
     })
     global.chrome = {
@@ -478,6 +478,15 @@ describe("idle sweep runtime", () => {
     now += 60_000
     await runTabLifecycleSweep(now)
     expect(removed).toEqual([])
+  })
+
+  test("the sweep prunes receipts whose group no longer exists (lost without onRemoved)", async () => {
+    groups = [{ id: 10, title: "interceptor-live" }]
+    local["createdTabGroup:10"] = { label: "live", createdAt: 1 }
+    local["createdTabGroup:77"] = { label: "gone", createdAt: 1 }
+    await runTabLifecycleSweep(now)
+    expect(local["createdTabGroup:77"]).toBeUndefined()
+    expect(local["createdTabGroup:10"]).toBeDefined()
   })
 
   test("a receipt whose id now names a personal group never closes it (ids are only unique per browser session)", async () => {

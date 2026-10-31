@@ -269,7 +269,14 @@ export async function runTabLifecycleSweep(now = Date.now()): Promise<void> {
   const brandTitles = await getCandidateTitles()
   const ownsTitle = (label: string, title: string) =>
     brandTitles.some((brand) => title === (label === "" ? brand : `${brand}-${label}`))
-  const groups = (await readCreatedTabGroups()).filter((g) =>
+  const receipts = await readCreatedTabGroups()
+  // A receipt for a group that no longer exists is never owner evidence; prune it so
+  // groups lost without onRemoved (browser exit, extension disabled) leave nothing behind.
+  const dead = receipts.filter((g) => !liveTitles.has(g.groupId)).map((g) => `createdTabGroup:${g.groupId}`)
+  if (dead.length > 0) {
+    try { await chrome.storage.local.remove(dead) } catch {}
+  }
+  const groups = receipts.filter((g) =>
     liveTitles.has(g.groupId) && ownsTitle(g.label, liveTitles.get(g.groupId)!))
   if (groups.length === 0) return
   // Duplicate labels share activity, but a survivor's refresh must not postpone
